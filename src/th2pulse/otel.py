@@ -111,6 +111,9 @@ def _init(
         set_logger_provider(provider)
 
     handler = LoggingHandler(level=level, logger_provider=provider)
+    from th2pulse.correlation import BaggageLogFilter
+
+    handler.addFilter(BaggageLogFilter())
     if redaction_patterns:
         from th2pulse.redaction import RedactionFilter
 

@@ -80,6 +80,14 @@ with conversation_context(session_id, user_id=email):
     ...  # spans/logs emitted here join the conversation
 ```
 
+Bridged log records emitted inside the context also carry
+`gen_ai.conversation.id` / `user.id` as OTLP **log attributes** (stamped
+from baggage by `BaggageLogFilter`, wired automatically). A log store can
+therefore filter application logs per conversation directly — no
+conversation↔trace mapping required. Stores that normalize attribute
+names (e.g. Loki structured metadata) expose them as
+`gen_ai_conversation_id` / `user_id`.
+
 ## Environment variables
 
 | Variable | Purpose |
