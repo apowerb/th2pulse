@@ -11,8 +11,15 @@ dependencies = [
     "opentelemetry-exporter-otlp-proto-http>=1.35,<2",
 ]
 
+[project.optional-dependencies]
+ingest = [
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
+    "asyncpg>=0.29",
+]
+
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "httpx>=0.27"]
 
 [build-system]
 requires = ["hatchling"]

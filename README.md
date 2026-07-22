@@ -80,6 +80,54 @@ with conversation_context(session_id, user_id=email):
     ...  # spans/logs emitted here join the conversation
 ```
 
+## Ingest service (collector → PostgreSQL → query API)
+
+`th2pulse.ingest` is the storage/query half of the pipeline: an OTLP/HTTP
+receiver that persists log records and the conversation ↔ trace mapping in
+PostgreSQL, then serves them per conversation to the monitoring frontend.
+
+```
+agents / services ──OTLP──▶ collector ──otlphttp (encoding: json)──▶ th2pulse.ingest ──▶ PostgreSQL
+                                                                         │
+                                                     front ◀── GET /logs?conversation_id=...
+```
+
+Point the collector at it:
+
+```yaml
+exporters:
+  otlphttp/pulse:
+    endpoint: http://127.0.0.1:4319
+    encoding: json          # required — the ingest speaks OTLP/JSON only
+service:
+  pipelines:
+    logs:   { receivers: [otlp], processors: [batch], exporters: [otlphttp/pulse] }
+    traces: { receivers: [otlp], processors: [batch], exporters: [otlphttp/pulse] }
+```
+
+Run it:
+
+```bash
+pip install "th2pulse[ingest]"
+export TH2PULSE_DB_DSN="postgresql://user:pass@host:5432/db?sslmode=require"
+export TH2PULSE_DB_SCHEMA="my_schema"        # optional
+python -m th2pulse.ingest                     # 127.0.0.1:4319
+```
+
+Endpoints:
+
+| Route | Purpose |
+|---|---|
+| `POST /v1/logs`, `/v1/traces` | OTLP receivers (traces feed the conversation map; spans themselves are not stored) |
+| `POST /v1/metrics` | Accepted and dropped (metrics stay collector-side for now) |
+| `GET /logs?conversation_id=&service=&level=&since=&limit=` | Log records, newest first |
+| `GET /conversations` | Known conversations with their trace ids |
+| `GET /healthz` | Liveness |
+
+The conversation map is built from `gen_ai.conversation.id` / `user.id`
+attributes — on spans (where ADK puts them natively) and on log records
+(where `conversation_context` propagates them).
+
 ## Environment variables
 
 | Variable | Purpose |
@@ -107,5 +155,5 @@ uv run pytest
 ## Roadmap
 
 * Traces/metrics bootstrap for non-ADK services (FastAPI instrumentation).
-* OTLP ingest receiver → PostgreSQL (backing the frontend monitoring API).
+* Span storage + retention policies in the ingest service.
 * Structured redaction presets shared across th2 services.
