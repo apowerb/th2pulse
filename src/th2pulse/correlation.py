@@ -13,11 +13,38 @@ same attribute names ADK uses.
 
 from __future__ import annotations
 
+import logging
 from contextlib import contextmanager
 from typing import Iterator
 
 CONVERSATION_ATTR = "gen_ai.conversation.id"
 USER_ATTR = "user.id"
+
+
+class BaggageLogFilter(logging.Filter):
+    """Stamp OTel baggage identity onto log records as attributes.
+
+    Attached automatically by ``init_observability`` to the OTLP handler:
+    records emitted inside :func:`conversation_context` carry
+    ``gen_ai.conversation.id`` / ``user.id`` as OTLP log attributes, so a
+    log store can filter them **per conversation directly** — no
+    conversation↔trace mapping needed for bridged application logs.
+    (Stores like Loki normalize dots: query ``gen_ai_conversation_id``.)
+    """
+
+    _KEYS = (CONVERSATION_ATTR, USER_ATTR)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            from opentelemetry import baggage
+
+            for key in self._KEYS:
+                value = baggage.get_baggage(key)
+                if value is not None:
+                    setattr(record, key, str(value))
+        except Exception:  # noqa: BLE001 - never drop or break a record
+            pass
+        return True
 
 
 @contextmanager
