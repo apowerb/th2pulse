@@ -126,11 +126,22 @@ Endpoints:
 
 | Route | Purpose |
 |---|---|
-| `POST /v1/logs`, `/v1/traces` | OTLP receivers (traces feed the conversation map; spans themselves are not stored) |
+| `POST /v1/logs`, `/v1/traces` | OTLP receivers (traces feed the conversation map **and** span storage) |
 | `POST /v1/metrics` | Accepted and dropped (metrics stay collector-side for now) |
-| `GET /logs?conversation_id=&service=&level=&since=&limit=` | Log records, newest first |
-| `GET /conversations` | Known conversations with their trace ids |
+| `GET /logs?conversation_id=&service=&level=&since=&limit=&user_id=` | Log records, newest first |
+| `GET /spans?conversation_id=&limit=&user_id=` | Spans: tool executions (name, args, response), LLM calls, durations |
+| `GET /conversations?user_id=` | Known conversations with their trace ids |
 | `GET /healthz` | Liveness |
+
+Writes are transactional per payload (a collector retry after a failure
+cannot duplicate committed rows) and span inserts are idempotent
+(`ON CONFLICT DO NOTHING`), so replaying an OTLP export is safe.
+`user_id` narrows every query to one user's conversations — callers doing
+authorization (e.g. a frontend proxy) should inject it server-side from a
+verified identity, never from client input. Optional hardening on top of
+the localhost-only bind: set `TH2PULSE_INGEST_TOKEN` and the POST
+endpoints require a matching `X-Th2Pulse-Token` header; payloads are
+capped (10 MB raw, 32 MB decompressed).
 
 The conversation map is built from `gen_ai.conversation.id` / `user.id`
 attributes — on spans (where ADK puts them natively) and on log records

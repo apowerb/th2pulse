@@ -69,6 +69,8 @@ SELECT ts, duration_ms, name, service, trace_id, span_id, parent_span_id,
 FROM pulse_spans
 WHERE ($1::text IS NULL OR trace_id IN (
           SELECT trace_id FROM pulse_conversation_map WHERE conversation_id = $1))
+  AND ($3::text IS NULL OR trace_id IN (
+          SELECT trace_id FROM pulse_conversation_map WHERE user_id = $3))
 ORDER BY ts DESC
 LIMIT $2
 """
@@ -90,6 +92,8 @@ WHERE ($1::text IS NULL OR trace_id IN (
   AND ($2::text IS NULL OR service = $2)
   AND ($3::smallint IS NULL OR severity_num >= $3)
   AND ($4::timestamptz IS NULL OR ts >= $4)
+  AND ($6::text IS NULL OR trace_id IN (
+          SELECT trace_id FROM pulse_conversation_map WHERE user_id = $6))
 ORDER BY ts DESC
 LIMIT $5
 """
@@ -101,6 +105,7 @@ SELECT conversation_id,
        count(*) AS trace_count,
        array_agg(trace_id ORDER BY first_seen) AS trace_ids
 FROM pulse_conversation_map
+WHERE ($2::text IS NULL OR user_id = $2)
 GROUP BY conversation_id
 ORDER BY min(first_seen) DESC
 LIMIT $1
@@ -115,58 +120,88 @@ class Store:
         self._schema = schema
         self._pool: asyncpg.Pool | None = None
 
+    # Arbitrary but stable key so concurrent instances (rolling restart)
+    # serialize DDL execution — CREATE TABLE IF NOT EXISTS is not atomic
+    # across concurrent transactions.
+    _DDL_LOCK_KEY = 0x7482_5055_4C53_4531
+
     async def connect(self) -> None:
         server_settings = {"search_path": self._schema} if self._schema else None
         self._pool = await asyncpg.create_pool(
             self._dsn, min_size=1, max_size=4, server_settings=server_settings,
         )
         async with self._pool.acquire() as conn:
-            await conn.execute(_DDL)
+            await conn.execute("SELECT pg_advisory_lock($1)", self._DDL_LOCK_KEY)
+            try:
+                await conn.execute(_DDL)
+            finally:
+                await conn.execute("SELECT pg_advisory_unlock($1)", self._DDL_LOCK_KEY)
 
     async def close(self) -> None:
         if self._pool:
             await self._pool.close()
             self._pool = None
 
-    async def insert_logs(self, rows: list[LogRow]) -> int:
-        if not rows:
-            return 0
-        assert self._pool is not None
-        args = [
+    @staticmethod
+    def _log_args(rows: list[LogRow]) -> list[tuple]:
+        return [
             (r.ts, r.severity_num, r.severity, r.service, r.trace_id, r.span_id,
              r.body, json.dumps(r.attributes, default=str),
              json.dumps(r.resource, default=str), r.event_name)
             for r in rows
         ]
-        async with self._pool.acquire() as conn:
-            await conn.executemany(_INSERT_LOG, args)
-        return len(rows)
 
-    async def insert_spans(self, spans: list[SpanRow]) -> int:
-        if not spans:
-            return 0
-        assert self._pool is not None
-        args = [
+    @staticmethod
+    def _span_args(spans: list[SpanRow]) -> list[tuple]:
+        return [
             (s.trace_id, s.span_id, s.parent_span_id, s.ts, s.duration_ms,
              s.name, s.service, s.status_code, s.status_message,
              json.dumps(s.attributes, default=str))
             for s in spans
         ]
-        async with self._pool.acquire() as conn:
-            await conn.executemany(_INSERT_SPAN, args)
-        return len(spans)
 
-    async def upsert_links(self, links: list[ConversationLink]) -> int:
-        if not links:
+    @staticmethod
+    def _link_args(links: list[ConversationLink]) -> list[tuple]:
+        return [
+            (link.conversation_id, link.trace_id, link.user_id, link.service,
+             link.first_seen)
+            for link in links
+        ]
+
+    async def ingest_logs(
+        self, rows: list[LogRow], links: list[ConversationLink],
+    ) -> int:
+        """Persist a logs payload atomically.
+
+        One transaction for rows + links: a failure rolls everything back,
+        so the collector's retry (otlphttp retries 5xx) cannot duplicate
+        already-committed rows.
+        """
+        if not rows and not links:
             return 0
         assert self._pool is not None
-        args = [
-            (l.conversation_id, l.trace_id, l.user_id, l.service, l.first_seen)
-            for l in links
-        ]
         async with self._pool.acquire() as conn:
-            await conn.executemany(_UPSERT_LINK, args)
-        return len(links)
+            async with conn.transaction():
+                if rows:
+                    await conn.executemany(_INSERT_LOG, self._log_args(rows))
+                if links:
+                    await conn.executemany(_UPSERT_LINK, self._link_args(links))
+        return len(rows)
+
+    async def ingest_traces(
+        self, links: list[ConversationLink], spans: list[SpanRow],
+    ) -> int:
+        """Persist a traces payload atomically (same rationale as ingest_logs)."""
+        if not links and not spans:
+            return 0
+        assert self._pool is not None
+        async with self._pool.acquire() as conn:
+            async with conn.transaction():
+                if links:
+                    await conn.executemany(_UPSERT_LINK, self._link_args(links))
+                if spans:
+                    await conn.executemany(_INSERT_SPAN, self._span_args(spans))
+        return len(spans)
 
     async def query_logs(
         self,
@@ -175,11 +210,13 @@ class Store:
         min_severity: int | None = None,
         since: datetime | None = None,
         limit: int = 100,
+        user_id: str | None = None,
     ) -> list[dict[str, Any]]:
         assert self._pool is not None
         async with self._pool.acquire() as conn:
             records = await conn.fetch(
-                _QUERY_LOGS, conversation_id, service, min_severity, since, limit,
+                _QUERY_LOGS, conversation_id, service, min_severity, since,
+                limit, user_id,
             )
         return [
             {**dict(r), "attributes": json.loads(r["attributes"])}
@@ -187,18 +224,23 @@ class Store:
         ]
 
     async def query_spans(
-        self, conversation_id: str | None = None, limit: int = 500,
+        self,
+        conversation_id: str | None = None,
+        limit: int = 500,
+        user_id: str | None = None,
     ) -> list[dict[str, Any]]:
         assert self._pool is not None
         async with self._pool.acquire() as conn:
-            records = await conn.fetch(_QUERY_SPANS, conversation_id, limit)
+            records = await conn.fetch(_QUERY_SPANS, conversation_id, limit, user_id)
         return [
             {**dict(r), "attributes": json.loads(r["attributes"])}
             for r in records
         ]
 
-    async def query_conversations(self, limit: int = 50) -> list[dict[str, Any]]:
+    async def query_conversations(
+        self, limit: int = 50, user_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         assert self._pool is not None
         async with self._pool.acquire() as conn:
-            records = await conn.fetch(_QUERY_CONVERSATIONS, limit)
+            records = await conn.fetch(_QUERY_CONVERSATIONS, limit, user_id)
         return [dict(r) for r in records]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import gzip
+import hmac
 import json
 import logging
 import os
@@ -19,18 +20,30 @@ logger = logging.getLogger("th2pulse.ingest")
 # OTLP/HTTP success response: empty partialSuccess = everything accepted.
 _OTLP_OK: dict[str, Any] = {"partialSuccess": {}}
 
+# Payload ceilings: the service buffers bodies in memory, and spans carry
+# tool arguments/responses — an unbounded body is an OOM waiting to happen.
+MAX_BODY_BYTES = 10 * 1024 * 1024
+MAX_DECOMPRESSED_BYTES = 32 * 1024 * 1024
+
+INGEST_TOKEN_HEADER = "x-th2pulse-token"
+
 
 def create_app(store: Store | None = None) -> FastAPI:
     """Build the ingest app.
 
     Without an explicit ``store``, configuration comes from the environment:
-    ``TH2PULSE_DB_DSN`` (required) and ``TH2PULSE_DB_SCHEMA`` (optional).
+    ``TH2PULSE_DB_DSN`` (required), ``TH2PULSE_DB_SCHEMA`` (optional) and
+    ``TH2PULSE_INGEST_TOKEN`` (optional shared secret: when set, POST
+    endpoints require a matching ``X-Th2Pulse-Token`` header — a cheap
+    defense-in-depth on top of the localhost-only bind).
     """
     if store is None:
         dsn = os.environ.get("TH2PULSE_DB_DSN")
         if not dsn:
             raise RuntimeError("TH2PULSE_DB_DSN is required to run the ingest service")
         store = Store(dsn, schema=os.environ.get("TH2PULSE_DB_SCHEMA"))
+
+    ingest_token = os.environ.get("TH2PULSE_INGEST_TOKEN") or None
 
     @asynccontextmanager
     async def lifespan(_: FastAPI):
@@ -42,29 +55,37 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     app = FastAPI(title="th2pulse ingest", lifespan=lifespan)
 
+    def _check_ingest_token(request: Request) -> None:
+        if ingest_token is None:
+            return
+        provided = request.headers.get(INGEST_TOKEN_HEADER, "")
+        if not hmac.compare_digest(provided, ingest_token):
+            raise HTTPException(401, detail="missing or invalid ingest token")
+
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
     @app.post("/v1/logs")
     async def ingest_logs(request: Request) -> dict[str, Any]:
+        _check_ingest_token(request)
         payload = await _json_body(request)
         rows, links = parse_logs(payload)
-        await store.insert_logs(rows)
-        await store.upsert_links(links)
+        await store.ingest_logs(rows, links)
         return _OTLP_OK
 
     @app.post("/v1/traces")
     async def ingest_traces(request: Request) -> dict[str, Any]:
+        _check_ingest_token(request)
         payload = await _json_body(request)
         links, spans = parse_traces(payload)
-        await store.upsert_links(links)
-        await store.insert_spans(spans)
+        await store.ingest_traces(links, spans)
         return _OTLP_OK
 
     @app.post("/v1/metrics")
     async def ingest_metrics(request: Request) -> dict[str, Any]:
         # Accepted and dropped: metrics stay on the collector side for now.
+        _check_ingest_token(request)
         await request.body()
         return _OTLP_OK
 
@@ -75,6 +96,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         level: str | None = None,
         since: datetime | None = None,
         limit: int = Query(default=100, ge=1, le=1000),
+        user_id: str | None = None,
     ) -> dict[str, Any]:
         min_severity = None
         if level is not None:
@@ -87,6 +109,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             min_severity=min_severity,
             since=since,
             limit=limit,
+            user_id=user_id,
         )
         return {"count": len(rows), "logs": rows}
 
@@ -94,15 +117,19 @@ def create_app(store: Store | None = None) -> FastAPI:
     async def get_spans(
         conversation_id: str | None = None,
         limit: int = Query(default=500, ge=1, le=2000),
+        user_id: str | None = None,
     ) -> dict[str, Any]:
-        rows = await store.query_spans(conversation_id=conversation_id, limit=limit)
+        rows = await store.query_spans(
+            conversation_id=conversation_id, limit=limit, user_id=user_id,
+        )
         return {"count": len(rows), "spans": rows}
 
     @app.get("/conversations")
     async def get_conversations(
         limit: int = Query(default=50, ge=1, le=500),
+        user_id: str | None = None,
     ) -> dict[str, Any]:
-        rows = await store.query_conversations(limit=limit)
+        rows = await store.query_conversations(limit=limit, user_id=user_id)
         return {"count": len(rows), "conversations": rows}
 
     return app
@@ -118,7 +145,12 @@ async def _json_body(request: Request) -> dict[str, Any]:
             detail="expected application/json — set `encoding: json` "
                    "on the collector's otlphttp exporter",
         )
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+        raise HTTPException(413, detail="payload too large")
     body = await request.body()
+    if len(body) > MAX_BODY_BYTES:
+        raise HTTPException(413, detail="payload too large")
     # The otlphttp exporter gzips payloads by default; Starlette does not
     # transparently decompress request bodies.
     if request.headers.get("content-encoding", "").lower() == "gzip":
@@ -126,6 +158,8 @@ async def _json_body(request: Request) -> dict[str, Any]:
             body = gzip.decompress(body)
         except OSError as exc:
             raise HTTPException(400, detail=f"invalid gzip body: {exc}") from exc
+        if len(body) > MAX_DECOMPRESSED_BYTES:
+            raise HTTPException(413, detail="decompressed payload too large")
     try:
         return json.loads(body)
     except ValueError as exc:
