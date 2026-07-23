@@ -10,6 +10,8 @@ from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
+from datetime import timedelta, timezone
+
 from fastapi import FastAPI, HTTPException, Query, Request
 
 from th2pulse.ingest.parsing import min_severity_number, parse_logs, parse_traces
@@ -123,6 +125,15 @@ def create_app(store: Store | None = None) -> FastAPI:
             conversation_id=conversation_id, limit=limit, user_id=user_id,
         )
         return {"count": len(rows), "spans": rows}
+
+    @app.get("/stats")
+    async def get_stats(
+        hours: int = Query(default=24, ge=1, le=720),
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        since = datetime.now(tz=timezone.utc) - timedelta(hours=hours)
+        stats = await store.query_stats(since=since, user_id=user_id)
+        return {"hours": hours, **stats}
 
     @app.get("/conversations")
     async def get_conversations(

@@ -98,6 +98,28 @@ def test_user_scoping_in_sql():
     _with_store(scenario)
 
 
+def test_stats_aggregates_and_scoping():
+    async def scenario(store):
+        inv = SpanRow(ts=TS, duration_ms=2000.0, name="invocation", service="svc",
+                      trace_id=TRACE, span_id="d" * 16, parent_span_id=None,
+                      status_code=None, status_message=None, attributes={})
+        llm = SpanRow(ts=TS, duration_ms=1000.0, name="generate_content m",
+                      service="svc", trace_id=TRACE, span_id="e" * 16,
+                      parent_span_id=None, status_code=None, status_message=None,
+                      attributes={"gen_ai.usage.input_tokens": 100,
+                                  "gen_ai.usage.output_tokens": 10})
+        await store.ingest_traces([_link()], [inv, llm, _span()])
+        since = datetime(2026, 7, 1, tzinfo=timezone.utc)
+        stats = await store.query_stats(since=since)
+        assert stats["conversations"] == 1 and stats["turns"] == 1
+        assert stats["avg_turn_ms"] == 2000.0
+        assert stats["tool_calls"] == 1
+        assert stats["input_tokens"] == 100 and stats["output_tokens"] == 10
+        scoped = await store.query_stats(since=since, user_id="bob@x.io")
+        assert scoped["conversations"] == 0 and scoped["input_tokens"] == 0
+    _with_store(scenario)
+
+
 def test_failed_batch_rolls_back_entirely():
     async def scenario(store):
         bad_link = ConversationLink(conversation_id=None, trace_id=TRACE,  # type: ignore[arg-type]

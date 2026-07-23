@@ -49,6 +49,12 @@ class FakeStore:
         return [{"conversation_id": link.conversation_id} for link in self.links
                 if user_id is None or link.user_id == user_id]
 
+    async def query_stats(self, since, user_id=None):
+        self.stats_args = {"since": since, "user_id": user_id}
+        return {"conversations": 1, "turns": 2, "avg_turn_ms": 1500.0,
+                "p95_turn_ms": 3000.0, "tool_calls": 4, "input_tokens": 100,
+                "output_tokens": 10, "app_errors": 0}
+
 
 @pytest.fixture()
 def client():
@@ -145,6 +151,13 @@ def test_user_scoping_filters_conversations_and_logs(client):
     assert other["count"] == 0
     convs = client.get("/conversations", params={"user_id": "bob@x.io"}).json()
     assert convs["count"] == 0
+
+
+def test_stats_endpoint(client):
+    data = client.get("/stats", params={"hours": 48, "user_id": "a@x"}).json()
+    assert data["hours"] == 48
+    assert data["turns"] == 2 and data["app_errors"] == 0
+    assert client.get("/stats", params={"hours": 0}).status_code == 422
 
 
 def test_oversized_payload_rejected(client):

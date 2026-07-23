@@ -98,6 +98,37 @@ ORDER BY ts DESC
 LIMIT $5
 """
 
+_QUERY_STATS = """
+WITH scoped AS (
+    SELECT m.trace_id, m.conversation_id
+    FROM pulse_conversation_map m
+    WHERE ($1::text IS NULL OR m.user_id = $1)
+      AND m.first_seen >= $2
+)
+SELECT
+    count(DISTINCT sc.conversation_id) AS conversations,
+    count(DISTINCT sc.trace_id) AS turns,
+    avg(s.duration_ms) FILTER (WHERE s.name = 'invocation') AS avg_turn_ms,
+    percentile_cont(0.95) WITHIN GROUP (ORDER BY s.duration_ms)
+        FILTER (WHERE s.name = 'invocation') AS p95_turn_ms,
+    count(s.span_id) FILTER (WHERE s.name LIKE 'execute_tool%') AS tool_calls,
+    coalesce(sum((s.attributes ->> 'gen_ai.usage.input_tokens')::numeric), 0)
+        AS input_tokens,
+    coalesce(sum((s.attributes ->> 'gen_ai.usage.output_tokens')::numeric), 0)
+        AS output_tokens
+FROM scoped sc
+LEFT JOIN pulse_spans s ON s.trace_id = sc.trace_id
+"""
+
+_QUERY_APP_ERRORS = """
+SELECT count(*) AS app_errors
+FROM pulse_logs
+WHERE severity_num >= 17
+  AND ts >= $2
+  AND ($1::text IS NULL OR trace_id IN (
+          SELECT trace_id FROM pulse_conversation_map WHERE user_id = $1))
+"""
+
 _QUERY_CONVERSATIONS = """
 SELECT conversation_id,
        min(first_seen) AS first_seen,
@@ -244,3 +275,18 @@ class Store:
         async with self._pool.acquire() as conn:
             records = await conn.fetch(_QUERY_CONVERSATIONS, limit, user_id)
         return [dict(r) for r in records]
+
+    async def query_stats(
+        self, since: datetime, user_id: str | None = None,
+    ) -> dict[str, Any]:
+        assert self._pool is not None
+        async with self._pool.acquire() as conn:
+            stats = await conn.fetchrow(_QUERY_STATS, user_id, since)
+            errors = await conn.fetchrow(_QUERY_APP_ERRORS, user_id, since)
+        out = dict(stats)
+        out["app_errors"] = errors["app_errors"]
+        for key in ("avg_turn_ms", "p95_turn_ms"):
+            out[key] = float(out[key]) if out[key] is not None else None
+        for key in ("input_tokens", "output_tokens"):
+            out[key] = int(out[key])
+        return out
