@@ -57,8 +57,9 @@ def create_app(store: Store | None = None) -> FastAPI:
     @app.post("/v1/traces")
     async def ingest_traces(request: Request) -> dict[str, Any]:
         payload = await _json_body(request)
-        links = parse_traces(payload)
+        links, spans = parse_traces(payload)
         await store.upsert_links(links)
+        await store.insert_spans(spans)
         return _OTLP_OK
 
     @app.post("/v1/metrics")
@@ -88,6 +89,14 @@ def create_app(store: Store | None = None) -> FastAPI:
             limit=limit,
         )
         return {"count": len(rows), "logs": rows}
+
+    @app.get("/spans")
+    async def get_spans(
+        conversation_id: str | None = None,
+        limit: int = Query(default=500, ge=1, le=2000),
+    ) -> dict[str, Any]:
+        rows = await store.query_spans(conversation_id=conversation_id, limit=limit)
+        return {"count": len(rows), "spans": rows}
 
     @app.get("/conversations")
     async def get_conversations(

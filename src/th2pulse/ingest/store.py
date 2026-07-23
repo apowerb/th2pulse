@@ -7,7 +7,7 @@ from typing import Any
 
 import asyncpg
 
-from th2pulse.ingest.parsing import ConversationLink, LogRow
+from th2pulse.ingest.parsing import ConversationLink, LogRow, SpanRow
 
 _DDL = """
 CREATE TABLE IF NOT EXISTS pulse_logs (
@@ -33,12 +33,44 @@ CREATE TABLE IF NOT EXISTS pulse_conversation_map (
     PRIMARY KEY (conversation_id, trace_id)
 );
 CREATE INDEX IF NOT EXISTS idx_pulse_conv_trace ON pulse_conversation_map (trace_id);
+ALTER TABLE pulse_logs ADD COLUMN IF NOT EXISTS event_name TEXT;
+CREATE TABLE IF NOT EXISTS pulse_spans (
+    trace_id TEXT NOT NULL,
+    span_id TEXT NOT NULL,
+    parent_span_id TEXT,
+    ts TIMESTAMPTZ NOT NULL,
+    duration_ms DOUBLE PRECISION,
+    name TEXT NOT NULL DEFAULT '',
+    service TEXT,
+    status_code TEXT,
+    status_message TEXT,
+    attributes JSONB NOT NULL DEFAULT '{}'::jsonb,
+    PRIMARY KEY (trace_id, span_id)
+);
+CREATE INDEX IF NOT EXISTS idx_pulse_spans_ts ON pulse_spans (ts DESC);
 """
 
 _INSERT_LOG = """
 INSERT INTO pulse_logs (ts, severity_num, severity, service, trace_id, span_id,
-                        body, attributes, resource)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb)
+                        body, attributes, resource, event_name)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10)
+"""
+
+_INSERT_SPAN = """
+INSERT INTO pulse_spans (trace_id, span_id, parent_span_id, ts, duration_ms,
+                         name, service, status_code, status_message, attributes)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+ON CONFLICT (trace_id, span_id) DO NOTHING
+"""
+
+_QUERY_SPANS = """
+SELECT ts, duration_ms, name, service, trace_id, span_id, parent_span_id,
+       status_code, status_message, attributes
+FROM pulse_spans
+WHERE ($1::text IS NULL OR trace_id IN (
+          SELECT trace_id FROM pulse_conversation_map WHERE conversation_id = $1))
+ORDER BY ts DESC
+LIMIT $2
 """
 
 _UPSERT_LINK = """
@@ -50,7 +82,8 @@ SET user_id = COALESCE(pulse_conversation_map.user_id, EXCLUDED.user_id),
 """
 
 _QUERY_LOGS = """
-SELECT ts, severity, severity_num, service, trace_id, span_id, body, attributes
+SELECT ts, severity, severity_num, service, trace_id, span_id, body, attributes,
+       event_name
 FROM pulse_logs
 WHERE ($1::text IS NULL OR trace_id IN (
           SELECT trace_id FROM pulse_conversation_map WHERE conversation_id = $1))
@@ -102,12 +135,26 @@ class Store:
         args = [
             (r.ts, r.severity_num, r.severity, r.service, r.trace_id, r.span_id,
              r.body, json.dumps(r.attributes, default=str),
-             json.dumps(r.resource, default=str))
+             json.dumps(r.resource, default=str), r.event_name)
             for r in rows
         ]
         async with self._pool.acquire() as conn:
             await conn.executemany(_INSERT_LOG, args)
         return len(rows)
+
+    async def insert_spans(self, spans: list[SpanRow]) -> int:
+        if not spans:
+            return 0
+        assert self._pool is not None
+        args = [
+            (s.trace_id, s.span_id, s.parent_span_id, s.ts, s.duration_ms,
+             s.name, s.service, s.status_code, s.status_message,
+             json.dumps(s.attributes, default=str))
+            for s in spans
+        ]
+        async with self._pool.acquire() as conn:
+            await conn.executemany(_INSERT_SPAN, args)
+        return len(spans)
 
     async def upsert_links(self, links: list[ConversationLink]) -> int:
         if not links:
@@ -134,6 +181,17 @@ class Store:
             records = await conn.fetch(
                 _QUERY_LOGS, conversation_id, service, min_severity, since, limit,
             )
+        return [
+            {**dict(r), "attributes": json.loads(r["attributes"])}
+            for r in records
+        ]
+
+    async def query_spans(
+        self, conversation_id: str | None = None, limit: int = 500,
+    ) -> list[dict[str, Any]]:
+        assert self._pool is not None
+        async with self._pool.acquire() as conn:
+            records = await conn.fetch(_QUERY_SPANS, conversation_id, limit)
         return [
             {**dict(r), "attributes": json.loads(r["attributes"])}
             for r in records

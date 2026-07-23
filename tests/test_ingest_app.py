@@ -14,7 +14,7 @@ TRACE = "d" * 32
 
 class FakeStore:
     def __init__(self):
-        self.logs, self.links = [], []
+        self.logs, self.links, self.spans = [], [], []
 
     async def connect(self): ...
     async def close(self): ...
@@ -26,6 +26,13 @@ class FakeStore:
     async def upsert_links(self, links):
         self.links.extend(links)
         return len(links)
+
+    async def insert_spans(self, spans):
+        self.spans.extend(spans)
+        return len(spans)
+
+    async def query_spans(self, conversation_id=None, limit=500):
+        return [{"name": s.name, "trace_id": s.trace_id} for s in self.spans]
 
     async def query_logs(self, conversation_id=None, service=None,
                          min_severity=None, since=None, limit=100):
@@ -60,7 +67,9 @@ def _otlp_logs(body: str, severity=9):
 def _otlp_traces(conversation_id: str):
     return {"resourceSpans": [{"resource": {"attributes": []}, "scopeSpans": [
         {"spans": [{
-            "traceId": TRACE, "startTimeUnixNano": "1753200000000000000",
+            "traceId": TRACE, "spanId": "f" * 16,
+            "name": "execute_tool send_mail",
+            "startTimeUnixNano": "1753200000000000000",
             "attributes": [{"key": "gen_ai.conversation.id",
                             "value": {"stringValue": conversation_id}}],
         }]}]}]}
@@ -104,6 +113,13 @@ def test_non_json_content_type_rejected_with_hint(client):
                        headers={"content-type": "application/x-protobuf"})
     assert resp.status_code == 415
     assert "encoding: json" in resp.json()["detail"]
+
+
+def test_traces_store_spans_served_by_spans_endpoint(client):
+    assert client.post("/v1/traces", json=_otlp_traces("conv-9")).status_code == 200
+    data = client.get("/spans", params={"conversation_id": "conv-9"}).json()
+    assert data["count"] == 1
+    assert data["spans"][0]["name"] == "execute_tool send_mail"
 
 
 def test_metrics_accepted_and_dropped(client):

@@ -33,6 +33,21 @@ class LogRow:
     body: str
     attributes: dict[str, Any]
     resource: dict[str, Any]
+    event_name: str | None = None
+
+
+@dataclass(frozen=True)
+class SpanRow:
+    ts: datetime
+    duration_ms: float | None
+    name: str
+    service: str | None
+    trace_id: str
+    span_id: str
+    parent_span_id: str | None
+    status_code: str | None
+    status_message: str | None
+    attributes: dict[str, Any]
 
 
 @dataclass(frozen=True)
@@ -143,6 +158,7 @@ def parse_logs(payload: dict[str, Any]) -> tuple[list[LogRow], list[Conversation
                     body=_body_text(record.get("body")),
                     attributes=attrs,
                     resource=resource,
+                    event_name=record.get("eventName") or None,
                 ))
                 link = _link_from_attrs(attrs, trace_id, service, ts)
                 if link:
@@ -150,24 +166,52 @@ def parse_logs(payload: dict[str, Any]) -> tuple[list[LogRow], list[Conversation
     return rows, links
 
 
-def parse_traces(payload: dict[str, Any]) -> list[ConversationLink]:
-    """OTLP traces payload -> conversation<->trace links (spans are not stored)."""
+def parse_traces(
+    payload: dict[str, Any],
+) -> tuple[list[ConversationLink], list[SpanRow]]:
+    """OTLP traces payload -> conversation<->trace links + span rows.
+
+    Spans carry what the GenAI event logs redact: tool names, call
+    arguments, tool responses, model names, durations — the practical
+    substance of agent monitoring.
+    """
     links: list[ConversationLink] = []
+    spans: list[SpanRow] = []
     for resource_spans in payload.get("resourceSpans", []):
         resource = _attributes(resource_spans.get("resource", {}).get("attributes"))
         service = resource.get("service.name")
         for scope_spans in resource_spans.get("scopeSpans", []):
             for span in scope_spans.get("spans", []):
                 attrs = _attributes(span.get("attributes"))
-                link = _link_from_attrs(
-                    attrs,
-                    _hex_id(span.get("traceId")),
-                    service,
-                    _ts(span.get("startTimeUnixNano")),
-                )
+                trace_id = _hex_id(span.get("traceId"))
+                span_id = _hex_id(span.get("spanId"))
+                start = _ts(span.get("startTimeUnixNano"))
+                link = _link_from_attrs(attrs, trace_id, service, start)
                 if link:
                     links.append(link)
-    return links
+                if not trace_id or not span_id:
+                    continue
+                duration_ms = None
+                try:
+                    duration_ms = (
+                        int(span["endTimeUnixNano"]) - int(span["startTimeUnixNano"])
+                    ) / 1e6
+                except (KeyError, TypeError, ValueError):
+                    pass
+                status = span.get("status") or {}
+                spans.append(SpanRow(
+                    ts=start,
+                    duration_ms=duration_ms,
+                    name=span.get("name") or "",
+                    service=service,
+                    trace_id=trace_id,
+                    span_id=span_id,
+                    parent_span_id=_hex_id(span.get("parentSpanId")),
+                    status_code=str(status["code"]) if status.get("code") else None,
+                    status_message=status.get("message") or None,
+                    attributes=attrs,
+                ))
+    return links, spans
 
 
 def min_severity_number(level: str) -> int | None:

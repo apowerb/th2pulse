@@ -69,7 +69,7 @@ def test_parse_logs_conversation_attr_creates_link():
     assert links[0].service == "th2agent-dev"
 
 
-def test_parse_traces_extracts_links():
+def test_parse_traces_extracts_links_and_spans():
     payload = {
         "resourceSpans": [{
             "resource": {"attributes": [
@@ -78,23 +78,44 @@ def test_parse_traces_extracts_links():
             "scopeSpans": [{"spans": [
                 {
                     "traceId": TRACE,
+                    "spanId": SPAN,
+                    "name": "execute_tool tool_send_email",
                     "startTimeUnixNano": "1753200000000000000",
+                    "endTimeUnixNano": "1753200000250000000",
                     "attributes": [
                         {"key": "gen_ai.conversation.id",
                          "value": {"stringValue": "sess-42"}},
                         {"key": "user.id", "value": {"stringValue": "u@x.io"}},
+                        {"key": "gen_ai.tool.name",
+                         "value": {"stringValue": "tool_send_email"}},
                     ],
                 },
-                {"traceId": "c" * 32, "attributes": []},  # no conversation attr
+                {"traceId": "c" * 32, "spanId": "e" * 16, "name": "call_llm",
+                 "startTimeUnixNano": "1753200001000000000", "attributes": []},
             ]}],
         }]
     }
-    links = parse_traces(payload)
+    links, spans = parse_traces(payload)
     assert len(links) == 1
     link = links[0]
     assert link.conversation_id == "sess-42"
     assert link.user_id == "u@x.io"
     assert link.first_seen == datetime.fromtimestamp(1753200000, tz=timezone.utc)
+
+    assert len(spans) == 2
+    tool = spans[0]
+    assert tool.name == "execute_tool tool_send_email"
+    assert tool.duration_ms == 250.0
+    assert tool.attributes["gen_ai.tool.name"] == "tool_send_email"
+    assert tool.service == "th2agent-dev"
+    assert spans[1].duration_ms is None  # no end timestamp
+
+
+def test_parse_logs_event_name():
+    rows, _ = parse_logs(_logs_payload(eventName="gen_ai.choice"))
+    assert rows[0].event_name == "gen_ai.choice"
+    rows, _ = parse_logs(_logs_payload())
+    assert rows[0].event_name is None
 
 
 def test_min_severity_number():
