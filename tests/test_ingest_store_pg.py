@@ -136,6 +136,38 @@ def test_annotations_scoped_write_and_read():
     _with_store(scenario)
 
 
+def test_alert_lifecycle_open_dedup_resolve():
+    async def scenario(store):
+        failing = SpanRow(
+            ts=datetime.now(timezone.utc), duration_ms=76.0,
+            name="execute_tool tool_send_email", service="svc",
+            trace_id=TRACE, span_id="f" * 16, parent_span_id=None,
+            status_code=None, status_message=None,
+            attributes={"gen_ai.tool.name": "tool_send_email"},
+            business_error=True,
+        )
+        await store.ingest_traces([_link()], [failing])
+
+        first = await store.evaluate_alerts(window_minutes=15)
+        assert first["opened"] == 1
+        second = await store.evaluate_alerts(window_minutes=15)
+        assert second["opened"] == 0  # dedup: one open alert per rule+target
+
+        alerts = await store.query_alerts(active=True, user_id="alice@x.io")
+        assert len(alerts) == 1
+        assert alerts[0]["rule_key"] == "tool_failure"
+        assert alerts[0]["target"] == "c1"
+        # Scoping: another user sees nothing.
+        assert await store.query_alerts(active=True, user_id="bob@x.io") == []
+
+        # Condition clears (evaluate over a window where nothing happened
+        # by making the span "old" relative to a 0-minute window).
+        cleared = await store.evaluate_alerts(window_minutes=0)
+        assert cleared["resolved"] == 1
+        assert await store.query_alerts(active=True) == []
+    _with_store(scenario)
+
+
 def test_failed_batch_rolls_back_entirely():
     async def scenario(store):
         bad_link = ConversationLink(conversation_id=None, trace_id=TRACE,  # type: ignore[arg-type]

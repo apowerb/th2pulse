@@ -8,12 +8,40 @@ hex-encoded, timestamps as stringified unix nanos.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
 CONVERSATION_ATTR = "gen_ai.conversation.id"
 USER_ATTR = "user.id"
+TOOL_RESPONSE_ATTR = "gcp.vertex.agent.tool_response"
+
+# ADK leaves the span status UNSET even when a tool business-fails; the
+# failure signal lives in the tool response payload. Single source of
+# truth for "this tool call failed" — the frontend mirrors this logic.
+_ERROR_CODE_RE = re.compile(
+    r"missing|error|fail|denied|invalid|unauthorized|timeout", re.IGNORECASE,
+)
+_WAITING_CODE_RE = re.compile(r"pending|required", re.IGNORECASE)
+
+
+def business_error(attributes: dict[str, Any]) -> bool:
+    """True when a tool response carries an error-like code."""
+    raw = attributes.get(TOOL_RESPONSE_ATTR)
+    if not raw:
+        return False
+    try:
+        parsed = json.loads(raw)
+    except (TypeError, ValueError):
+        return False
+    code = parsed.get("code") or parsed.get("error") or (
+        parsed.get("status") if isinstance(parsed.get("status"), str) else None
+    )
+    if not code:
+        return False
+    code = str(code)
+    return bool(_ERROR_CODE_RE.search(code)) and not _WAITING_CODE_RE.search(code)
 
 # OTLP severity number ranges (lower bound of each bucket).
 SEVERITY_FLOOR = {
@@ -48,6 +76,7 @@ class SpanRow:
     status_code: str | None
     status_message: str | None
     attributes: dict[str, Any]
+    business_error: bool = False
 
 
 @dataclass(frozen=True)
@@ -210,6 +239,7 @@ def parse_traces(
                     status_code=str(status["code"]) if status.get("code") else None,
                     status_message=status.get("message") or None,
                     attributes=attrs,
+                    business_error=business_error(attrs),
                 ))
     return links, spans
 

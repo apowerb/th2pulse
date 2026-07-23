@@ -118,6 +118,40 @@ def test_parse_logs_event_name():
     assert rows[0].event_name is None
 
 
+def test_business_error_detection():
+    from th2pulse.ingest.parsing import business_error
+
+    fail = {"gcp.vertex.agent.tool_response":
+            '{"code": "INTEGRATION_MISSING", "provider": "google_gmail"}'}
+    assert business_error(fail) is True
+    pending = {"gcp.vertex.agent.tool_response":
+               '{"status": "user_input_pending"}'}
+    assert business_error(pending) is False
+    ok = {"gcp.vertex.agent.tool_response": '{"status": "ok"}'}
+    assert business_error(ok) is False
+    assert business_error({}) is False
+    assert business_error({"gcp.vertex.agent.tool_response": "{oops"}) is False
+
+
+def test_parse_traces_flags_business_error():
+    payload = {
+        "resourceSpans": [{
+            "resource": {"attributes": []},
+            "scopeSpans": [{"spans": [{
+                "traceId": TRACE, "spanId": SPAN,
+                "name": "execute_tool tool_send_email",
+                "startTimeUnixNano": "1753200000000000000",
+                "attributes": [
+                    {"key": "gcp.vertex.agent.tool_response",
+                     "value": {"stringValue": '{"code": "INTEGRATION_MISSING"}'}},
+                ],
+            }]}],
+        }]
+    }
+    _, spans = parse_traces(payload)
+    assert spans[0].business_error is True
+
+
 def test_min_severity_number():
     assert min_severity_number("info") == 9
     assert min_severity_number("WARNING") == 13

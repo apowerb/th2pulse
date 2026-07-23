@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import json
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import asyncpg
@@ -58,6 +58,19 @@ CREATE TABLE IF NOT EXISTS pulse_annotations (
 );
 CREATE INDEX IF NOT EXISTS idx_pulse_annotations_conv
     ON pulse_annotations (conversation_id);
+ALTER TABLE pulse_spans ADD COLUMN IF NOT EXISTS
+    business_error BOOLEAN NOT NULL DEFAULT FALSE;
+CREATE TABLE IF NOT EXISTS pulse_alerts (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    rule_key TEXT NOT NULL,
+    target TEXT NOT NULL DEFAULT 'global',
+    severity TEXT NOT NULL DEFAULT 'warning',
+    message TEXT NOT NULL,
+    triggered_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    resolved_at TIMESTAMPTZ
+);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_pulse_alerts_open
+    ON pulse_alerts (rule_key, target) WHERE resolved_at IS NULL;
 """
 
 _INSERT_ANNOTATION = """
@@ -87,9 +100,68 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9::jsonb, $10)
 
 _INSERT_SPAN = """
 INSERT INTO pulse_spans (trace_id, span_id, parent_span_id, ts, duration_ms,
-                         name, service, status_code, status_message, attributes)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb)
+                         name, service, status_code, status_message, attributes,
+                         business_error)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11)
 ON CONFLICT (trace_id, span_id) DO NOTHING
+"""
+
+# ── Alerting: each rule yields (target, message) rows for conditions that
+# are CURRENTLY true over the sliding window. Stateless evaluation:
+# condition true + no open alert → open ; condition false + open → resolve.
+
+_RULE_TOOL_FAILURE = """
+SELECT COALESCE(m.conversation_id, 'global') AS target,
+       count(*) AS n
+FROM pulse_spans s
+LEFT JOIN pulse_conversation_map m ON m.trace_id = s.trace_id
+WHERE s.business_error AND s.ts >= $1
+GROUP BY 1
+"""
+
+_RULE_APP_ERROR = """
+SELECT COALESCE(m.conversation_id, 'global') AS target,
+       count(*) AS n
+FROM pulse_logs l
+LEFT JOIN pulse_conversation_map m ON m.trace_id = l.trace_id
+WHERE l.severity_num >= 17 AND l.ts >= $1
+GROUP BY 1
+"""
+
+_RULE_P95 = """
+SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95
+FROM pulse_spans
+WHERE name = 'invocation' AND ts >= $1
+"""
+
+_RULE_TOKENS = """
+SELECT coalesce(sum((attributes ->> 'gen_ai.usage.input_tokens')::numeric), 0)
+       AS tokens
+FROM pulse_spans
+WHERE ts >= $1
+"""
+
+_OPEN_ALERT = """
+INSERT INTO pulse_alerts (rule_key, target, severity, message)
+VALUES ($1, $2, $3, $4)
+ON CONFLICT (rule_key, target) WHERE resolved_at IS NULL DO NOTHING
+"""
+
+_RESOLVE_STALE = """
+UPDATE pulse_alerts
+SET resolved_at = now()
+WHERE rule_key = $1 AND resolved_at IS NULL AND NOT (target = ANY($2::text[]))
+"""
+
+_QUERY_ALERTS = """
+SELECT id, rule_key, target, severity, message, triggered_at, resolved_at
+FROM pulse_alerts
+WHERE ($1::bool IS DISTINCT FROM TRUE OR resolved_at IS NULL)
+  AND ($2::text IS NULL OR (target <> 'global' AND EXISTS (
+      SELECT 1 FROM pulse_conversation_map
+      WHERE conversation_id = target AND user_id = $2)))
+ORDER BY triggered_at DESC
+LIMIT $3
 """
 
 _QUERY_SPANS = """
@@ -216,7 +288,7 @@ class Store:
         return [
             (s.trace_id, s.span_id, s.parent_span_id, s.ts, s.duration_ms,
              s.name, s.service, s.status_code, s.status_message,
-             json.dumps(s.attributes, default=str))
+             json.dumps(s.attributes, default=str), s.business_error)
             for s in spans
         ]
 
@@ -328,6 +400,72 @@ class Store:
         assert self._pool is not None
         async with self._pool.acquire() as conn:
             records = await conn.fetch(_QUERY_ANNOTATIONS, conversation_id, user_id)
+        return [dict(r) for r in records]
+
+    async def evaluate_alerts(
+        self,
+        window_minutes: int = 15,
+        p95_threshold_ms: float = 10_000,
+        tokens_24h_threshold: int = 2_000_000,
+    ) -> dict[str, int]:
+        """One stateless evaluation pass: open alerts for currently-true
+        conditions, resolve open alerts whose condition cleared."""
+        assert self._pool is not None
+        since = datetime.now(tz=timezone.utc) - timedelta(minutes=window_minutes)
+        since_24h = datetime.now(tz=timezone.utc) - timedelta(hours=24)
+        opened = resolved = 0
+        async with self._pool.acquire() as conn:
+            active: dict[str, list[tuple[str, str, str]]] = {}
+
+            rows = await conn.fetch(_RULE_TOOL_FAILURE, since)
+            active["tool_failure"] = [
+                (r["target"], "error",
+                 f"{r['n']} failed tool call(s) in the last {window_minutes} min")
+                for r in rows
+            ]
+            rows = await conn.fetch(_RULE_APP_ERROR, since)
+            active["app_error"] = [
+                (r["target"], "error",
+                 f"{r['n']} application error log(s) in the last {window_minutes} min")
+                for r in rows
+            ]
+            p95 = (await conn.fetchrow(_RULE_P95, since))["p95"]
+            active["latency_p95"] = (
+                [("global", "warning",
+                  f"p95 turn latency {p95 / 1000:.1f} s over the last "
+                  f"{window_minutes} min (threshold {p95_threshold_ms / 1000:.0f} s)")]
+                if p95 is not None and float(p95) > p95_threshold_ms else []
+            )
+            tokens = int((await conn.fetchrow(_RULE_TOKENS, since_24h))["tokens"])
+            active["token_budget"] = (
+                [("global", "warning",
+                  f"{tokens:,} input tokens over 24 h "
+                  f"(budget {tokens_24h_threshold:,})")]
+                if tokens > tokens_24h_threshold else []
+            )
+
+            for rule_key, entries in active.items():
+                for target, severity, message in entries:
+                    result = await conn.execute(
+                        _OPEN_ALERT, rule_key, target, severity, message,
+                    )
+                    if result.endswith("1"):
+                        opened += 1
+                result = await conn.execute(
+                    _RESOLVE_STALE, rule_key, [t for t, _, _ in entries],
+                )
+                resolved += int(result.split()[-1])
+        return {"opened": opened, "resolved": resolved}
+
+    async def query_alerts(
+        self,
+        active: bool = True,
+        user_id: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        assert self._pool is not None
+        async with self._pool.acquire() as conn:
+            records = await conn.fetch(_QUERY_ALERTS, active, user_id, limit)
         return [dict(r) for r in records]
 
     async def query_stats(

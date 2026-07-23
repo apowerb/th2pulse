@@ -66,6 +66,14 @@ class FakeStore:
         return [a for a in self.annotations
                 if a["conversation_id"] == conversation_id]
 
+    async def evaluate_alerts(self, **kwargs):
+        return {"opened": 0, "resolved": 0}
+
+    async def query_alerts(self, active=True, user_id=None, limit=100):
+        self.alerts_args = {"active": active, "user_id": user_id}
+        return [{"rule_key": "tool_failure", "target": "conv-A",
+                 "severity": "error", "message": "1 failed tool call(s)"}]
+
     async def query_stats(self, since, user_id=None):
         self.stats_args = {"since": since, "user_id": user_id}
         return {"conversations": 1, "turns": 2, "avg_turn_ms": 1500.0,
@@ -191,6 +199,12 @@ def test_annotations_roundtrip_and_scope(client):
         "conversation_id": "conv-A", "author": "a@x.io", "note": "",
     })
     assert invalid.status_code == 422
+
+
+def test_alerts_endpoint(client):
+    data = client.get("/alerts", params={"user_id": "a@x"}).json()
+    assert data["count"] == 1
+    assert data["alerts"][0]["rule_key"] == "tool_failure"
 
 
 def test_stats_endpoint(client):

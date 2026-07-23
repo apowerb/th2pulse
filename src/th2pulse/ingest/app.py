@@ -1,6 +1,7 @@
 """FastAPI app: OTLP receiver endpoints + query API for the frontend."""
 from __future__ import annotations
 
+import asyncio
 import gzip
 import hmac
 import json
@@ -47,12 +48,35 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     ingest_token = os.environ.get("TH2PULSE_INGEST_TOKEN") or None
 
+    alert_interval = int(os.environ.get("TH2PULSE_ALERT_INTERVAL_S", "60"))
+    alert_p95_ms = float(os.environ.get("TH2PULSE_ALERT_P95_MS", "10000"))
+    alert_tokens_24h = int(os.environ.get("TH2PULSE_ALERT_TOKENS_24H", "2000000"))
+
+    async def _alert_loop() -> None:
+        # Sleep first: never race service startup, never tick in fast tests.
+        while True:
+            await asyncio.sleep(alert_interval)
+            try:
+                outcome = await store.evaluate_alerts(
+                    p95_threshold_ms=alert_p95_ms,
+                    tokens_24h_threshold=alert_tokens_24h,
+                )
+                if outcome.get("opened") or outcome.get("resolved"):
+                    logger.info("alert evaluation: %s", outcome)
+            except Exception:  # noqa: BLE001 - the evaluator must never die
+                logger.exception("alert evaluation failed")
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         await store.connect()
+        task = (
+            asyncio.create_task(_alert_loop()) if alert_interval > 0 else None
+        )
         try:
             yield
         finally:
+            if task:
+                task.cancel()
             await store.close()
 
     app = FastAPI(title="th2pulse ingest", lifespan=lifespan)
@@ -159,6 +183,15 @@ def create_app(store: Store | None = None) -> FastAPI:
         if annotation_id is None:
             raise HTTPException(404, detail="conversation not found in caller scope")
         return {"id": annotation_id}
+
+    @app.get("/alerts")
+    async def get_alerts(
+        active: bool = True,
+        user_id: str | None = None,
+        limit: int = Query(default=100, ge=1, le=500),
+    ) -> dict[str, Any]:
+        rows = await store.query_alerts(active=active, user_id=user_id, limit=limit)
+        return {"count": len(rows), "alerts": rows}
 
     @app.get("/stats")
     async def get_stats(
