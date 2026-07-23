@@ -120,6 +120,22 @@ def test_stats_aggregates_and_scoping():
     _with_store(scenario)
 
 
+def test_annotations_scoped_write_and_read():
+    async def scenario(store):
+        await store.ingest_traces([_link(user="alice@x.io")], [_span()])
+        denied = await store.insert_annotation(
+            "c1", TRACE, "mallory@x.io", "spam", user_id="mallory@x.io",
+        )
+        assert denied is None
+        ok = await store.insert_annotation(
+            "c1", TRACE, "alice@x.io", "looks bad", user_id="alice@x.io",
+        )
+        assert isinstance(ok, int)
+        notes = await store.query_annotations("c1", user_id="alice@x.io")
+        assert len(notes) == 1 and notes[0]["note"] == "looks bad"
+    _with_store(scenario)
+
+
 def test_failed_batch_rolls_back_entirely():
     async def scenario(store):
         bad_link = ConversationLink(conversation_id=None, trace_id=TRACE,  # type: ignore[arg-type]

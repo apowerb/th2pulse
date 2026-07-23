@@ -12,7 +12,7 @@ TRACE = "d" * 32
 
 class FakeStore:
     def __init__(self):
-        self.logs, self.links, self.spans = [], [], []
+        self.logs, self.links, self.spans, self.annotations = [], [], [], []
 
     async def connect(self): ...
     async def close(self): ...
@@ -48,6 +48,23 @@ class FakeStore:
     async def query_conversations(self, limit=50, user_id=None):
         return [{"conversation_id": link.conversation_id} for link in self.links
                 if user_id is None or link.user_id == user_id]
+
+    async def insert_annotation(self, conversation_id, trace_id, author, note,
+                                user_id=None):
+        if user_id is not None and not any(
+            link.conversation_id == conversation_id and link.user_id == user_id
+            for link in self.links
+        ):
+            return None
+        self.annotations.append({
+            "conversation_id": conversation_id, "trace_id": trace_id,
+            "author": author, "note": note,
+        })
+        return len(self.annotations)
+
+    async def query_annotations(self, conversation_id, user_id=None):
+        return [a for a in self.annotations
+                if a["conversation_id"] == conversation_id]
 
     async def query_stats(self, since, user_id=None):
         self.stats_args = {"since": since, "user_id": user_id}
@@ -151,6 +168,29 @@ def test_user_scoping_filters_conversations_and_logs(client):
     assert other["count"] == 0
     convs = client.get("/conversations", params={"user_id": "bob@x.io"}).json()
     assert convs["count"] == 0
+
+
+def test_annotations_roundtrip_and_scope(client):
+    client.post("/v1/traces", json=_otlp_traces("conv-A"))
+    ok = client.post("/annotations", json={
+        "conversation_id": "conv-A", "trace_id": TRACE,
+        "author": "alice@x.io", "note": "reproduced the bug here",
+    })
+    assert ok.status_code == 200 and "id" in ok.json()
+
+    got = client.get("/annotations", params={"conversation_id": "conv-A"}).json()
+    assert got["count"] == 1
+    assert got["annotations"][0]["note"] == "reproduced the bug here"
+
+    denied = client.post("/annotations", params={"user_id": "mallory@x.io"}, json={
+        "conversation_id": "conv-A", "author": "mallory@x.io", "note": "spam",
+    })
+    assert denied.status_code == 404
+
+    invalid = client.post("/annotations", json={
+        "conversation_id": "conv-A", "author": "a@x.io", "note": "",
+    })
+    assert invalid.status_code == 422
 
 
 def test_stats_endpoint(client):

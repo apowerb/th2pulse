@@ -126,6 +126,40 @@ def create_app(store: Store | None = None) -> FastAPI:
         )
         return {"count": len(rows), "spans": rows}
 
+    @app.get("/annotations")
+    async def get_annotations(
+        conversation_id: str,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        rows = await store.query_annotations(
+            conversation_id=conversation_id, user_id=user_id,
+        )
+        return {"count": len(rows), "annotations": rows}
+
+    @app.post("/annotations")
+    async def post_annotation(
+        request: Request,
+        user_id: str | None = None,
+    ) -> dict[str, Any]:
+        payload = await _json_body(request)
+        conversation_id = payload.get("conversation_id")
+        note = (payload.get("note") or "").strip()
+        author = (payload.get("author") or "").strip()
+        if not conversation_id or not author:
+            raise HTTPException(422, detail="conversation_id and author are required")
+        if not note or len(note) > 2000:
+            raise HTTPException(422, detail="note must be 1..2000 characters")
+        annotation_id = await store.insert_annotation(
+            conversation_id=conversation_id,
+            trace_id=payload.get("trace_id"),
+            author=author,
+            note=note,
+            user_id=user_id,
+        )
+        if annotation_id is None:
+            raise HTTPException(404, detail="conversation not found in caller scope")
+        return {"id": annotation_id}
+
     @app.get("/stats")
     async def get_stats(
         hours: int = Query(default=24, ge=1, le=720),

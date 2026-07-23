@@ -48,6 +48,35 @@ CREATE TABLE IF NOT EXISTS pulse_spans (
     PRIMARY KEY (trace_id, span_id)
 );
 CREATE INDEX IF NOT EXISTS idx_pulse_spans_ts ON pulse_spans (ts DESC);
+CREATE TABLE IF NOT EXISTS pulse_annotations (
+    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    conversation_id TEXT NOT NULL,
+    trace_id TEXT,
+    author TEXT NOT NULL,
+    note TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS idx_pulse_annotations_conv
+    ON pulse_annotations (conversation_id);
+"""
+
+_INSERT_ANNOTATION = """
+INSERT INTO pulse_annotations (conversation_id, trace_id, author, note)
+SELECT $1, $2, $3, $4
+WHERE $5::text IS NULL OR EXISTS (
+    SELECT 1 FROM pulse_conversation_map
+    WHERE conversation_id = $1 AND user_id = $5)
+RETURNING id
+"""
+
+_QUERY_ANNOTATIONS = """
+SELECT id, conversation_id, trace_id, author, note, created_at
+FROM pulse_annotations
+WHERE conversation_id = $1
+  AND ($2::text IS NULL OR EXISTS (
+      SELECT 1 FROM pulse_conversation_map
+      WHERE conversation_id = $1 AND user_id = $2))
+ORDER BY created_at
 """
 
 _INSERT_LOG = """
@@ -274,6 +303,31 @@ class Store:
         assert self._pool is not None
         async with self._pool.acquire() as conn:
             records = await conn.fetch(_QUERY_CONVERSATIONS, limit, user_id)
+        return [dict(r) for r in records]
+
+    async def insert_annotation(
+        self,
+        conversation_id: str,
+        trace_id: str | None,
+        author: str,
+        note: str,
+        user_id: str | None = None,
+    ) -> int | None:
+        """Insert a human note; scoped writers may only annotate their own
+        conversations (returns None when the scope check rejects)."""
+        assert self._pool is not None
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow(
+                _INSERT_ANNOTATION, conversation_id, trace_id, author, note, user_id,
+            )
+        return row["id"] if row else None
+
+    async def query_annotations(
+        self, conversation_id: str, user_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        assert self._pool is not None
+        async with self._pool.acquire() as conn:
+            records = await conn.fetch(_QUERY_ANNOTATIONS, conversation_id, user_id)
         return [dict(r) for r in records]
 
     async def query_stats(
