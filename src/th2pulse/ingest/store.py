@@ -128,6 +128,19 @@ WHERE l.severity_num >= 17 AND l.ts >= $1
 GROUP BY 1
 """
 
+# An OTLP error status (LLM API/auth failure, tool crash) propagates up the
+# whole span tree, so we count only the leaf spans that originate a failure
+# (generate_content / execute_tool) — otherwise one error inflates to four.
+_RULE_SPAN_ERROR = """
+SELECT COALESCE(m.conversation_id, 'global') AS target,
+       count(*) AS n
+FROM pulse_spans s
+LEFT JOIN pulse_conversation_map m ON m.trace_id = s.trace_id
+WHERE s.status_code IN ('2', 'STATUS_CODE_ERROR') AND s.ts >= $1
+  AND (s.name LIKE 'generate_content%' OR s.name LIKE 'execute_tool%')
+GROUP BY 1
+"""
+
 _RULE_P95 = """
 SELECT percentile_cont(0.95) WITHIN GROUP (ORDER BY duration_ms) AS p95
 FROM pulse_spans
@@ -433,6 +446,12 @@ class Store:
             active["app_error"] = [
                 (r["target"], "error",
                  f"{r['n']} application error log(s) in the last {window_minutes} min")
+                for r in rows
+            ]
+            rows = await conn.fetch(_RULE_SPAN_ERROR, since)
+            active["span_error"] = [
+                (r["target"], "error",
+                 f"{r['n']} failed LLM/tool call(s) in the last {window_minutes} min")
                 for r in rows
             ]
             p95 = (await conn.fetchrow(_RULE_P95, since))["p95"]

@@ -181,6 +181,33 @@ def test_alert_lifecycle_open_dedup_resolve():
     _with_store(scenario)
 
 
+def test_span_error_status_raises_alert_once():
+    async def scenario(store):
+        now = datetime.now(timezone.utc)
+        # One LLM failure propagates to 4 spans (leaf + ancestors); only the
+        # leaf generate_content must count — a single alert, not four.
+        common = dict(status_code="2", status_message="APIError: Forbidden",
+                      service="svc", trace_id=TRACE, business_error=False)
+        gen = SpanRow(ts=now, duration_ms=100.0, name="generate_content m",
+                      span_id="a" * 16, parent_span_id=None, attributes={},
+                      **common)
+        call = SpanRow(ts=now, duration_ms=110.0, name="call_llm",
+                       span_id="b" * 16, parent_span_id="a" * 16, attributes={},
+                       **common)
+        inv = SpanRow(ts=now, duration_ms=120.0, name="invoke_agent x",
+                      span_id="c" * 16, parent_span_id=None, attributes={},
+                      **common)
+        await store.ingest_traces([_link()], [gen, call, inv])
+
+        opened = await store.evaluate_alerts(window_minutes=15)
+        assert opened["opened"] == 1  # not 3
+        alerts = await store.query_alerts(active=True)
+        assert len(alerts) == 1
+        assert alerts[0]["rule_key"] == "span_error"
+        assert "1 failed LLM/tool call" in alerts[0]["message"]
+    _with_store(scenario)
+
+
 def test_failed_batch_rolls_back_entirely():
     async def scenario(store):
         bad_link = ConversationLink(conversation_id=None, trace_id=TRACE,  # type: ignore[arg-type]
