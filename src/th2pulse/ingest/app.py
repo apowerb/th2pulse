@@ -53,6 +53,9 @@ def create_app(store: Store | None = None) -> FastAPI:
     alert_p95_ms = float(os.environ.get("TH2PULSE_ALERT_P95_MS", "10000"))
     alert_tokens_24h = int(os.environ.get("TH2PULSE_ALERT_TOKENS_24H", "2000000"))
 
+    retention_interval = int(os.environ.get("TH2PULSE_RETENTION_INTERVAL_S", "3600"))
+    retention_days = int(os.environ.get("TH2PULSE_RETENTION_DAYS", "15"))
+
     async def _alert_loop() -> None:
         # Sleep first: never race service startup, never tick in fast tests.
         while True:
@@ -67,16 +70,33 @@ def create_app(store: Store | None = None) -> FastAPI:
             except Exception:  # noqa: BLE001 - the evaluator must never die
                 logger.exception("alert evaluation failed")
 
+    async def _retention_loop() -> None:
+        # Sleep first: never race service startup, never tick in fast tests.
+        while True:
+            await asyncio.sleep(retention_interval)
+            try:
+                deleted = await store.prune_old(retention_days)
+                total = sum(deleted.values())
+                if total:
+                    logger.info(
+                        "retention pruned %d row(s) older than %d days: %s",
+                        total, retention_days, deleted,
+                    )
+            except Exception:  # noqa: BLE001 - retention must never die
+                logger.exception("retention prune failed")
+
     @asynccontextmanager
     async def lifespan(_: FastAPI):
         await store.connect()
-        task = (
-            asyncio.create_task(_alert_loop()) if alert_interval > 0 else None
-        )
+        tasks: list[asyncio.Task] = []
+        if alert_interval > 0:
+            tasks.append(asyncio.create_task(_alert_loop()))
+        if retention_interval > 0:
+            tasks.append(asyncio.create_task(_retention_loop()))
         try:
             yield
         finally:
-            if task:
+            for task in tasks:
                 task.cancel()
             await store.close()
 

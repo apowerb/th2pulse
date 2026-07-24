@@ -11,7 +11,7 @@ pools are loop-bound).
 """
 import asyncio
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -216,4 +216,80 @@ def test_failed_batch_rolls_back_entirely():
             await store.ingest_logs([_row()], [bad_link])
         # The log insert from the failed batch must not have been committed.
         assert await store.query_logs() == []
+    _with_store(scenario)
+
+
+def test_prune_old_drops_aged_rows_and_keeps_open_alerts():
+    async def scenario(store):
+        now = datetime.now(timezone.utc)
+        old = now - timedelta(days=20)  # past the 15-day threshold
+        old_trace, new_trace = "1" * 32, "2" * 32
+
+        def _s(trace, span, ts):
+            return SpanRow(ts=ts, duration_ms=1.0, name="execute_tool t",
+                           service="svc", trace_id=trace, span_id=span,
+                           parent_span_id=None, status_code=None,
+                           status_message=None, attributes={})
+
+        def _l(trace, span, ts, body):
+            return LogRow(ts=ts, severity_num=9, severity="INFO", service="svc",
+                          trace_id=trace, span_id=span, body=body,
+                          attributes={}, resource={}, event_name=None)
+
+        old_link = ConversationLink(conversation_id="cold", trace_id=old_trace,
+                                    user_id="u", service="svc", first_seen=old)
+        new_link = ConversationLink(conversation_id="cnew", trace_id=new_trace,
+                                    user_id="u", service="svc", first_seen=now)
+        await store.ingest_traces(
+            [old_link, new_link],
+            [_s(old_trace, "a" * 16, old), _s(new_trace, "b" * 16, now)],
+        )
+        await store.ingest_logs(
+            [_l(old_trace, "a" * 16, old, "old"),
+             _l(new_trace, "b" * 16, now, "new")],
+            [],
+        )
+
+        # Annotations and alerts need explicit historical timestamps that the
+        # public API (created_at/triggered_at default to now()) cannot set.
+        conn = await asyncpg.connect(DSN)
+        try:
+            await conn.execute(f"SET search_path TO {SCHEMA}")
+            await conn.execute(
+                "INSERT INTO pulse_annotations "
+                "(conversation_id, trace_id, author, note, created_at) "
+                "VALUES ($1,$2,$3,$4,$5),($6,$7,$8,$9,$10)",
+                "cold", old_trace, "a", "old note", old,
+                "cnew", new_trace, "a", "new note", now,
+            )
+            await conn.execute(
+                "INSERT INTO pulse_alerts "
+                "(rule_key, target, severity, message, triggered_at, resolved_at) "
+                "VALUES ($1,$2,$3,$4,$5,$6),($7,$8,$9,$10,$11,$12)",
+                "r_open", "t1", "warning", "old but open", old, None,
+                "r_done", "t2", "warning", "old and resolved", old, old,
+            )
+        finally:
+            await conn.close()
+
+        deleted = await store.prune_old(15)
+
+        assert deleted["pulse_logs"] == 1
+        assert deleted["pulse_spans"] == 1
+        assert deleted["pulse_conversation_map"] == 1
+        assert deleted["pulse_annotations"] == 1
+        assert deleted["pulse_alerts"] == 1  # only the resolved one
+
+        # Recent rows survive across every table.
+        assert len(await store.query_spans()) == 1
+        assert len(await store.query_logs()) == 1
+        convs = await store.query_conversations()
+        assert len(convs) == 1 and convs[0]["conversation_id"] == "cnew"
+        assert len(await store.query_annotations("cnew")) == 1
+        assert await store.query_annotations("cold") == []
+
+        # The old OPEN alert is retained; the old RESOLVED alert is gone.
+        remaining = await store.query_alerts(active=False)
+        assert len(remaining) == 1
+        assert remaining[0]["rule_key"] == "r_open"
     _with_store(scenario)

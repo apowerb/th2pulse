@@ -262,6 +262,24 @@ ORDER BY min(first_seen) DESC
 LIMIT $1
 """
 
+# ── Retention: prune telemetry older than N days by its event timestamp.
+# Alerts are the exception — only *resolved* ones are pruned; an open alert
+# is kept regardless of age so a standing incident never silently vanishes.
+_PRUNE_LOGS = "DELETE FROM pulse_logs WHERE ts < now() - make_interval(days => $1)"
+_PRUNE_SPANS = "DELETE FROM pulse_spans WHERE ts < now() - make_interval(days => $1)"
+_PRUNE_CONVERSATION_MAP = (
+    "DELETE FROM pulse_conversation_map "
+    "WHERE first_seen < now() - make_interval(days => $1)"
+)
+_PRUNE_ANNOTATIONS = (
+    "DELETE FROM pulse_annotations "
+    "WHERE created_at < now() - make_interval(days => $1)"
+)
+_PRUNE_ALERTS = (
+    "DELETE FROM pulse_alerts "
+    "WHERE resolved_at IS NOT NULL AND triggered_at < now() - make_interval(days => $1)"
+)
+
 
 class Store:
     """Thin asyncpg wrapper. ``schema`` scopes every table via search_path."""
@@ -507,3 +525,24 @@ class Store:
         for key in ("input_tokens", "output_tokens", "cached_tokens"):
             out[key] = int(out[key])
         return out
+
+    async def prune_old(self, days: int) -> dict[str, int]:
+        """Delete telemetry older than ``days`` days; return {table: rows}.
+
+        Logs, spans, conversation links and annotations are pruned by their
+        event timestamp. Alerts are the exception: only *resolved* alerts are
+        pruned, so a still-open incident is retained no matter how old it is.
+        """
+        assert self._pool is not None
+        deleted: dict[str, int] = {}
+        async with self._pool.acquire() as conn:
+            for table, sql in (
+                ("pulse_logs", _PRUNE_LOGS),
+                ("pulse_spans", _PRUNE_SPANS),
+                ("pulse_conversation_map", _PRUNE_CONVERSATION_MAP),
+                ("pulse_annotations", _PRUNE_ANNOTATIONS),
+                ("pulse_alerts", _PRUNE_ALERTS),
+            ):
+                result = await conn.execute(sql, days)
+                deleted[table] = int(result.split()[-1])
+        return deleted
