@@ -78,7 +78,7 @@ class FakeStore:
         self.stats_args = {"since": since, "user_id": user_id}
         return {"conversations": 1, "turns": 2, "avg_turn_ms": 1500.0,
                 "p95_turn_ms": 3000.0, "tool_calls": 4, "input_tokens": 100,
-                "output_tokens": 10, "app_errors": 0}
+                "output_tokens": 10, "cached_tokens": 70, "app_errors": 0}
 
 
 @pytest.fixture()

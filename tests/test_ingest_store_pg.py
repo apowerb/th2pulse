@@ -98,23 +98,36 @@ def test_user_scoping_in_sql():
     _with_store(scenario)
 
 
-def test_stats_aggregates_and_scoping():
+def test_stats_aggregates_dedup_and_cache():
     async def scenario(store):
         inv = SpanRow(ts=TS, duration_ms=2000.0, name="invocation", service="svc",
                       trace_id=TRACE, span_id="d" * 16, parent_span_id=None,
                       status_code=None, status_message=None, attributes={})
-        llm = SpanRow(ts=TS, duration_ms=1000.0, name="generate_content m",
-                      service="svc", trace_id=TRACE, span_id="e" * 16,
-                      parent_span_id=None, status_code=None, status_message=None,
+        # ADK emits usage on BOTH call_llm and its generate_content child.
+        # Only the call_llm figure must count (avoid double-count), and it
+        # carries the cached mirror added by th2agent's usage callback.
+        call_llm = SpanRow(ts=TS, duration_ms=1000.0, name="call_llm",
+                           service="svc", trace_id=TRACE, span_id="e" * 16,
+                           parent_span_id=None, status_code=None,
+                           status_message=None,
+                           attributes={"gen_ai.usage.input_tokens": 100,
+                                       "gen_ai.usage.output_tokens": 10,
+                                       "gen_ai.usage.cached_input_tokens": 70})
+        gen = SpanRow(ts=TS, duration_ms=900.0, name="generate_content m",
+                      service="svc", trace_id=TRACE, span_id="f" * 16,
+                      parent_span_id="e" * 16, status_code=None,
+                      status_message=None,
                       attributes={"gen_ai.usage.input_tokens": 100,
                                   "gen_ai.usage.output_tokens": 10})
-        await store.ingest_traces([_link()], [inv, llm, _span()])
+        await store.ingest_traces([_link()], [inv, call_llm, gen, _span()])
         since = datetime(2026, 7, 1, tzinfo=timezone.utc)
         stats = await store.query_stats(since=since)
         assert stats["conversations"] == 1 and stats["turns"] == 1
         assert stats["avg_turn_ms"] == 2000.0
         assert stats["tool_calls"] == 1
+        # counted once (call_llm), NOT 200 despite the duplicate on generate_content
         assert stats["input_tokens"] == 100 and stats["output_tokens"] == 10
+        assert stats["cached_tokens"] == 70
         scoped = await store.query_stats(since=since, user_id="bob@x.io")
         assert scoped["conversations"] == 0 and scoped["input_tokens"] == 0
     _with_store(scenario)

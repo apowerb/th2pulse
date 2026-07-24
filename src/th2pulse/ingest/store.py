@@ -213,10 +213,16 @@ SELECT
     percentile_cont(0.95) WITHIN GROUP (ORDER BY s.duration_ms)
         FILTER (WHERE s.name = 'invocation') AS p95_turn_ms,
     count(s.span_id) FILTER (WHERE s.name LIKE 'execute_tool%') AS tool_calls,
-    coalesce(sum((s.attributes ->> 'gen_ai.usage.input_tokens')::numeric), 0)
-        AS input_tokens,
-    coalesce(sum((s.attributes ->> 'gen_ai.usage.output_tokens')::numeric), 0)
-        AS output_tokens
+    -- ADK emits usage on BOTH the call_llm span and its generate_content
+    -- child, so summing across all spans double-counts. Count each model
+    -- call once via call_llm — where the cached-token mirror also lands,
+    -- keeping input and cached on the same rows.
+    coalesce(sum((s.attributes ->> 'gen_ai.usage.input_tokens')::numeric)
+        FILTER (WHERE s.name LIKE 'call_llm%'), 0) AS input_tokens,
+    coalesce(sum((s.attributes ->> 'gen_ai.usage.output_tokens')::numeric)
+        FILTER (WHERE s.name LIKE 'call_llm%'), 0) AS output_tokens,
+    coalesce(sum((s.attributes ->> 'gen_ai.usage.cached_input_tokens')::numeric)
+        FILTER (WHERE s.name LIKE 'call_llm%'), 0) AS cached_tokens
 FROM scoped sc
 LEFT JOIN pulse_spans s ON s.trace_id = sc.trace_id
 """
@@ -479,6 +485,6 @@ class Store:
         out["app_errors"] = errors["app_errors"]
         for key in ("avg_turn_ms", "p95_turn_ms"):
             out[key] = float(out[key]) if out[key] is not None else None
-        for key in ("input_tokens", "output_tokens"):
+        for key in ("input_tokens", "output_tokens", "cached_tokens"):
             out[key] = int(out[key])
         return out
