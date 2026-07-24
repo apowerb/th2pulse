@@ -30,3 +30,7 @@ packages = ["src/th2pulse"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+[tool.ruff.lint]
+# Pin the intended rule set so a ruff release cannot repaint the repo red.
+select = ["E4", "E7", "E9", "F"]

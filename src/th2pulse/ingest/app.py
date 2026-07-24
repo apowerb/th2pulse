@@ -17,6 +17,7 @@ from fastapi import FastAPI, HTTPException, Query, Request
 
 from th2pulse.ingest.parsing import min_severity_number, parse_logs, parse_traces
 from th2pulse.ingest.store import Store
+from th2pulse.masking import mask_log_rows, mask_span_rows, masking_enabled
 
 logger = logging.getLogger("th2pulse.ingest")
 
@@ -97,6 +98,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         _check_ingest_token(request)
         payload = await _json_body(request)
         rows, links = parse_logs(payload)
+        if masking_enabled():
+            rows = mask_log_rows(rows)
         await store.ingest_logs(rows, links)
         return _OTLP_OK
 
@@ -105,6 +108,8 @@ def create_app(store: Store | None = None) -> FastAPI:
         _check_ingest_token(request)
         payload = await _json_body(request)
         links, spans = parse_traces(payload)
+        if masking_enabled():
+            spans = mask_span_rows(spans)
         await store.ingest_traces(links, spans)
         return _OTLP_OK
 
