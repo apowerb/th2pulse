@@ -2,18 +2,18 @@
 from __future__ import annotations
 
 import asyncio
-import gzip
 import hmac
 import json
 import logging
 import os
+import zlib
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
 from datetime import timedelta, timezone
 
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import Depends, FastAPI, HTTPException, Query, Request
 
 from th2pulse.ingest.parsing import min_severity_number, parse_logs, parse_traces
 from th2pulse.ingest.store import Store
@@ -28,18 +28,38 @@ _OTLP_OK: dict[str, Any] = {"partialSuccess": {}}
 # tool arguments/responses — an unbounded body is an OOM waiting to happen.
 MAX_BODY_BYTES = 10 * 1024 * 1024
 MAX_DECOMPRESSED_BYTES = 32 * 1024 * 1024
+# Slice size for incremental gunzip: caps how much a single decompress call
+# can produce, so the ceiling above is enforced while inflating, not after.
+_GUNZIP_CHUNK = 1024 * 1024
 
 INGEST_TOKEN_HEADER = "x-th2pulse-token"
+QUERY_TOKEN_HEADER = "x-th2pulse-query-token"
 
 
 def create_app(store: Store | None = None) -> FastAPI:
     """Build the ingest app.
 
     Without an explicit ``store``, configuration comes from the environment:
-    ``TH2PULSE_DB_DSN`` (required), ``TH2PULSE_DB_SCHEMA`` (optional) and
-    ``TH2PULSE_INGEST_TOKEN`` (optional shared secret: when set, POST
-    endpoints require a matching ``X-Th2Pulse-Token`` header — a cheap
-    defense-in-depth on top of the localhost-only bind).
+    ``TH2PULSE_DB_DSN`` (required) and ``TH2PULSE_DB_SCHEMA`` (optional).
+
+    Two independent shared secrets guard the two roles, so the collector and
+    the frontend can be rolled out separately:
+
+    ``TH2PULSE_INGEST_TOKEN``
+        write side — the OTLP ``POST /v1/*`` endpoints require a matching
+        ``X-Th2Pulse-Token`` header.
+    ``TH2PULSE_QUERY_TOKEN``
+        read side — every query endpoint (and ``POST /annotations``) requires
+        a matching ``X-Th2Pulse-Query-Token`` header.
+
+    **Trust model.** ``user_id`` is *authorization*, not authentication: this
+    service trusts its single caller (the frontend proxy) to derive it from a
+    verified identity, and an absent ``user_id`` deliberately means "no
+    scoping" so an admin view can span every user. That is only sound while
+    the caller is authenticated — hence the query token. Leaving either token
+    unset keeps the endpoints open to anything that can reach the socket, so
+    the service logs a warning at startup and relies solely on the
+    localhost-only bind.
     """
     if store is None:
         dsn = os.environ.get("TH2PULSE_DB_DSN")
@@ -48,6 +68,15 @@ def create_app(store: Store | None = None) -> FastAPI:
         store = Store(dsn, schema=os.environ.get("TH2PULSE_DB_SCHEMA"))
 
     ingest_token = os.environ.get("TH2PULSE_INGEST_TOKEN") or None
+    query_token = os.environ.get("TH2PULSE_QUERY_TOKEN") or None
+    for name, value in (("TH2PULSE_INGEST_TOKEN", ingest_token),
+                        ("TH2PULSE_QUERY_TOKEN", query_token)):
+        if value is None:
+            logger.warning(
+                "%s is not set: the matching endpoints accept any caller that "
+                "can reach the socket — the localhost-only bind is the sole "
+                "protection", name,
+            )
 
     alert_interval = int(os.environ.get("TH2PULSE_ALERT_INTERVAL_S", "60"))
     alert_p95_ms = float(os.environ.get("TH2PULSE_ALERT_P95_MS", "10000"))
@@ -109,6 +138,25 @@ def create_app(store: Store | None = None) -> FastAPI:
         if not hmac.compare_digest(provided, ingest_token):
             raise HTTPException(401, detail="missing or invalid ingest token")
 
+    def _check_query_token(request: Request) -> None:
+        """Authenticate the read side.
+
+        Without this, ``user_id`` alone decides what a caller sees — and
+        omitting it returns every user's telemetry. The token is what makes
+        "the caller is the trusted proxy" an enforced claim rather than an
+        assumption.
+        """
+        if query_token is None:
+            return
+        provided = request.headers.get(QUERY_TOKEN_HEADER, "")
+        if not hmac.compare_digest(provided, query_token):
+            raise HTTPException(401, detail="missing or invalid query token")
+
+    # Applied as a route dependency rather than a parameter on each handler:
+    # a new endpoint added later cannot silently skip the check by forgetting
+    # to call it, it can only skip it by explicitly omitting the guard.
+    query_guard = [Depends(_check_query_token)]
+
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
@@ -140,7 +188,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         await request.body()
         return _OTLP_OK
 
-    @app.get("/logs")
+    @app.get("/logs", dependencies=query_guard)
     async def get_logs(
         conversation_id: str | None = None,
         service: str | None = None,
@@ -164,7 +212,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         )
         return {"count": len(rows), "logs": rows}
 
-    @app.get("/spans")
+    @app.get("/spans", dependencies=query_guard)
     async def get_spans(
         conversation_id: str | None = None,
         limit: int = Query(default=500, ge=1, le=2000),
@@ -175,7 +223,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         )
         return {"count": len(rows), "spans": rows}
 
-    @app.get("/annotations")
+    @app.get("/annotations", dependencies=query_guard)
     async def get_annotations(
         conversation_id: str,
         user_id: str | None = None,
@@ -185,7 +233,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         )
         return {"count": len(rows), "annotations": rows}
 
-    @app.post("/annotations")
+    @app.post("/annotations", dependencies=query_guard)
     async def post_annotation(
         request: Request,
         user_id: str | None = None,
@@ -209,7 +257,7 @@ def create_app(store: Store | None = None) -> FastAPI:
             raise HTTPException(404, detail="conversation not found in caller scope")
         return {"id": annotation_id}
 
-    @app.get("/alerts")
+    @app.get("/alerts", dependencies=query_guard)
     async def get_alerts(
         active: bool = True,
         user_id: str | None = None,
@@ -218,7 +266,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         rows = await store.query_alerts(active=active, user_id=user_id, limit=limit)
         return {"count": len(rows), "alerts": rows}
 
-    @app.get("/stats")
+    @app.get("/stats", dependencies=query_guard)
     async def get_stats(
         hours: int = Query(default=24, ge=1, le=720),
         user_id: str | None = None,
@@ -227,7 +275,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         stats = await store.query_stats(since=since, user_id=user_id)
         return {"hours": hours, **stats}
 
-    @app.get("/conversations")
+    @app.get("/conversations", dependencies=query_guard)
     async def get_conversations(
         limit: int = Query(default=50, ge=1, le=500),
         user_id: str | None = None,
@@ -236,6 +284,40 @@ def create_app(store: Store | None = None) -> FastAPI:
         return {"count": len(rows), "conversations": rows}
 
     return app
+
+
+def _gunzip_bounded(body: bytes) -> bytes:
+    """Decompress gzip incrementally, aborting past MAX_DECOMPRESSED_BYTES.
+
+    ``gzip.decompress`` would materialise the whole stream before anything
+    could check its size: a few hundred KB of repetitive input expands to
+    gigabytes (ratios above 1000:1 are trivial to craft), which is an OOM
+    waiting to happen. Feeding a decompressobj in slices lets us stop the
+    moment the running total crosses the ceiling, so peak memory stays
+    bounded by the ceiling itself rather than by the attacker's payload.
+    """
+    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)  # 16 -> gzip header
+    chunks: list[bytes] = []
+    produced = 0
+    pending = body
+    try:
+        while True:
+            chunk = decompressor.decompress(pending, _GUNZIP_CHUNK)
+            produced += len(chunk)
+            if produced > MAX_DECOMPRESSED_BYTES:
+                raise HTTPException(413, detail="decompressed payload too large")
+            if chunk:
+                chunks.append(chunk)
+            # max_length caps one call: whatever input it could not consume
+            # yet lands in unconsumed_tail and must be fed back in.
+            pending = decompressor.unconsumed_tail
+            if not pending:
+                if decompressor.eof or not chunk:
+                    break
+                pending = b""  # keep draining output still buffered inside zlib
+    except zlib.error as exc:
+        raise HTTPException(400, detail=f"invalid gzip body: {exc}") from exc
+    return b"".join(chunks)
 
 
 async def _json_body(request: Request) -> dict[str, Any]:
@@ -257,12 +339,7 @@ async def _json_body(request: Request) -> dict[str, Any]:
     # The otlphttp exporter gzips payloads by default; Starlette does not
     # transparently decompress request bodies.
     if request.headers.get("content-encoding", "").lower() == "gzip":
-        try:
-            body = gzip.decompress(body)
-        except OSError as exc:
-            raise HTTPException(400, detail=f"invalid gzip body: {exc}") from exc
-        if len(body) > MAX_DECOMPRESSED_BYTES:
-            raise HTTPException(413, detail="decompressed payload too large")
+        body = _gunzip_bounded(body)
     try:
         return json.loads(body)
     except ValueError as exc:

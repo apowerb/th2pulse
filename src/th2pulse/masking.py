@@ -60,10 +60,28 @@ def mask_text(text: str) -> str:
 
 
 def mask_log_rows(rows: list[LogRow]) -> list[LogRow]:
-    return [
-        dataclasses.replace(row, body=mask_text(row.body)) if row.body else row
-        for row in rows
-    ]
+    """Mask the body *and* the free-form attributes of each record.
+
+    ``logging.info(msg, extra={...})`` lands in ``attributes`` and is stored
+    verbatim in JSONB; masking only the body left that side untouched while
+    the documentation promised raw content is never persisted.
+    """
+    out: list[LogRow] = []
+    for row in rows:
+        body = mask_text(row.body) if row.body else row.body
+        attributes = row.attributes
+        if attributes:
+            masked = {
+                key: mask_text(value)
+                for key, value in attributes.items()
+                if isinstance(value, str)
+            }
+            if masked:
+                attributes = {**attributes, **masked}
+        if body is not row.body or attributes is not row.attributes:
+            row = dataclasses.replace(row, body=body, attributes=attributes)
+        out.append(row)
+    return out
 
 
 def mask_span_rows(spans: list[SpanRow]) -> list[SpanRow]:

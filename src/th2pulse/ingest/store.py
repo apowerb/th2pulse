@@ -33,6 +33,18 @@ CREATE TABLE IF NOT EXISTS pulse_conversation_map (
     PRIMARY KEY (conversation_id, trace_id)
 );
 CREATE INDEX IF NOT EXISTS idx_pulse_conv_trace ON pulse_conversation_map (trace_id);
+-- Retention prunes on last activity, not on creation: a conversation opened
+-- weeks ago but still in use must keep its mapping, otherwise today's rows
+-- survive in pulse_logs while becoming invisible to any user-scoped query.
+-- Backfilled from first_seen so existing rows migrate without a data pass.
+ALTER TABLE pulse_conversation_map
+    ADD COLUMN IF NOT EXISTS last_seen TIMESTAMPTZ;
+UPDATE pulse_conversation_map SET last_seen = first_seen WHERE last_seen IS NULL;
+-- Five query paths filter or join on user_id; without this it is a seq scan
+-- that degrades as telemetry accumulates.
+CREATE INDEX IF NOT EXISTS idx_pulse_conv_user ON pulse_conversation_map (user_id);
+CREATE INDEX IF NOT EXISTS idx_pulse_conv_last_seen
+    ON pulse_conversation_map (last_seen);
 ALTER TABLE pulse_logs ADD COLUMN IF NOT EXISTS event_name TEXT;
 CREATE TABLE IF NOT EXISTS pulse_spans (
     trace_id TEXT NOT NULL,
@@ -190,11 +202,15 @@ LIMIT $2
 """
 
 _UPSERT_LINK = """
-INSERT INTO pulse_conversation_map (conversation_id, trace_id, user_id, service, first_seen)
-VALUES ($1, $2, $3, $4, $5)
+INSERT INTO pulse_conversation_map
+    (conversation_id, trace_id, user_id, service, first_seen, last_seen)
+VALUES ($1, $2, $3, $4, $5, $5)
 ON CONFLICT (conversation_id, trace_id) DO UPDATE
 SET user_id = COALESCE(pulse_conversation_map.user_id, EXCLUDED.user_id),
-    first_seen = LEAST(pulse_conversation_map.first_seen, EXCLUDED.first_seen)
+    first_seen = LEAST(pulse_conversation_map.first_seen, EXCLUDED.first_seen),
+    last_seen = GREATEST(
+        COALESCE(pulse_conversation_map.last_seen, pulse_conversation_map.first_seen),
+        EXCLUDED.last_seen)
 """
 
 _QUERY_LOGS = """
@@ -267,9 +283,13 @@ LIMIT $1
 # is kept regardless of age so a standing incident never silently vanishes.
 _PRUNE_LOGS = "DELETE FROM pulse_logs WHERE ts < now() - make_interval(days => $1)"
 _PRUNE_SPANS = "DELETE FROM pulse_spans WHERE ts < now() - make_interval(days => $1)"
+# Prune on last activity: pruning on first_seen orphaned long-running
+# conversations — their recent logs stayed in the table but no user-scoped
+# query could reach them any more. COALESCE covers rows written before
+# last_seen existed.
 _PRUNE_CONVERSATION_MAP = (
     "DELETE FROM pulse_conversation_map "
-    "WHERE first_seen < now() - make_interval(days => $1)"
+    "WHERE COALESCE(last_seen, first_seen) < now() - make_interval(days => $1)"
 )
 _PRUNE_ANNOTATIONS = (
     "DELETE FROM pulse_annotations "
