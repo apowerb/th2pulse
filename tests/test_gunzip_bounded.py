@@ -8,6 +8,7 @@ than hand-picked assertions.
 """
 import gzip
 import random
+import time
 import zlib
 
 import pytest
@@ -55,6 +56,23 @@ def test_multi_member_first_exceeds_chunk():
 def test_many_members():
     stream = b"".join(gzip.compress(f"m{i}".encode() * 1000) for i in range(25))
     assert _gunzip_bounded(stream) == gzip.decompress(stream)
+
+
+def test_hundreds_of_thousands_of_members_stay_cheap():
+    """Member count must cost linear time, not quadratic.
+
+    A body of 300k empty members fits well under MAX_BODY_BYTES yet produces
+    almost no output, so no size ceiling can catch it. A previous
+    implementation recopied the remaining input per member and took ~15s on
+    this input, blocking the whole event loop.
+    """
+    stream = gzip.compress(b"") * 300_000
+    assert len(stream) < 10 * 1024 * 1024, "probe must stay under the body cap"
+    start = time.perf_counter()
+    out = _gunzip_bounded(stream)
+    elapsed = time.perf_counter() - start
+    assert out == b""
+    assert elapsed < 5.0, f"300k members took {elapsed:.1f}s — quadratic again?"
 
 
 def test_bomb_is_rejected_with_bounded_memory():

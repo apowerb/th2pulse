@@ -72,6 +72,28 @@ def test_non_ascii_token_yields_401_not_500(client):
     assert res.status_code == 401
 
 
+def test_legitimate_non_ascii_token_is_accepted(monkeypatch):
+    """A secret with an accent must work, sent as a normal client sends it.
+
+    Starlette decodes header values as latin-1, so recovering the wire bytes
+    means re-encoding as latin-1 — encoding as UTF-8 instead rejected every
+    correct non-ASCII secret, silently killing all legitimate traffic.
+    """
+    monkeypatch.setenv("TH2PULSE_QUERY_TOKEN", "Sécret123")
+    monkeypatch.setenv("TH2PULSE_ALERT_INTERVAL_S", "0")
+    monkeypatch.setenv("TH2PULSE_RETENTION_INTERVAL_S", "0")
+    client = TestClient(create_app(_FakeStore()))
+
+    # What any HTTP client puts on the wire for that secret: UTF-8 bytes.
+    ok = client.get("/logs", headers={b"X-Th2Pulse-Query-Token":
+                                      "Sécret123".encode("utf-8")})
+    assert ok.status_code == 200, "correct non-ASCII secret was rejected"
+
+    bad = client.get("/logs", headers={b"X-Th2Pulse-Query-Token":
+                                       "Sécret124".encode("utf-8")})
+    assert bad.status_code == 401
+
+
 def test_healthz_stays_open(client):
     assert client.get("/healthz").status_code == 200
 

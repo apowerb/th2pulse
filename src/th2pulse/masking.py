@@ -34,7 +34,7 @@ MASK_PRESETS: list[tuple[str, re.Pattern[str]]] = [
     # attribute value was enough to pin a worker. RFC 5321 caps the local
     # part at 64 characters and a domain at 255, so nothing real is lost.
     ("[masked email]", re.compile(
-        r"\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,4}"
+        r"\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,12}"
         r"\.[A-Za-z]{2,24}\b")),
     ("[masked phone]", re.compile(
         r"(?<!\w)(?:\+|00)\d{1,3}(?:[ .-]?\(0\))?(?:[ .-]?\d{1,4}){3,6}(?!\w)"

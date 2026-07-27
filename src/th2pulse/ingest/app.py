@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import gzip
 import hmac
+import io
 import json
 import logging
 import os
@@ -132,15 +134,17 @@ def create_app(store: Store | None = None) -> FastAPI:
     app = FastAPI(title="th2pulse ingest", lifespan=lifespan)
 
     def _token_matches(provided: str, expected: str) -> bool:
-        """Constant-time compare that survives non-ASCII input.
+        """Constant-time compare over the bytes that were actually sent.
 
-        ``hmac.compare_digest`` raises TypeError on str arguments holding
-        non-ASCII, and a raw 0xE9 byte is perfectly legal in an HTTP header —
-        which turned a bogus token into a 500 instead of a 401. Comparing
-        UTF-8 bytes keeps the timing guarantee and the contract.
+        ``hmac.compare_digest`` raises TypeError on str holding non-ASCII,
+        and a raw 0xE9 byte is legal in an HTTP header — a bogus token
+        answered 500 instead of 401. Round-tripping through **latin-1** is
+        what recovers the wire bytes, because that is how Starlette decodes
+        header values; encoding as UTF-8 instead produced different bytes
+        and rejected a correct non-ASCII secret every single time.
         """
-        return hmac.compare_digest(provided.encode("utf-8", "surrogateescape"),
-                                   expected.encode("utf-8", "surrogateescape"))
+        return hmac.compare_digest(provided.encode("latin-1", "replace"),
+                                   expected.encode("utf-8"))
 
     def _check_ingest_token(request: Request) -> None:
         if ingest_token is None:
@@ -307,38 +311,23 @@ def _gunzip_bounded(body: bytes) -> bytes:
     moment the running total crosses the ceiling, so peak memory stays
     bounded by the ceiling itself rather than by the attacker's payload.
     """
-    chunks: list[bytes] = []
-    produced = 0
-    pending = body
+    # Hand-rolling this over zlib.decompressobj went wrong three times in a
+    # row — silent truncation, then an infinite loop on multi-member streams,
+    # then quadratic cost in the number of members (300k empty members in a
+    # 6 MB body froze the event loop for 15s). GzipFile already handles
+    # member boundaries, headers and framing, and reading from a BytesIO
+    # streams through the buffer instead of recopying the remainder each
+    # time. Bounding is then just a capped read: ask for one byte more than
+    # the ceiling and reject if we get it.
     try:
-        # A gzip stream may concatenate several members, and a decompressobj
-        # handles exactly one: once it reports eof it never consumes another
-        # byte, so reusing it silently drops the remaining members — or spins
-        # forever re-reading the same unconsumed_tail. Each member therefore
-        # gets its own decompressor, fed from the previous one's unused_data.
-        while pending:
-            member = zlib.decompressobj(16 + zlib.MAX_WBITS)  # 16 -> gzip header
-            data, pending = pending, b""
-            while True:
-                chunk = member.decompress(data, _GUNZIP_CHUNK)
-                produced += len(chunk)
-                if produced > MAX_DECOMPRESSED_BYTES:
-                    raise HTTPException(413, detail="decompressed payload too large")
-                if chunk:
-                    chunks.append(chunk)
-                if member.eof:
-                    pending = member.unused_data  # next member, if any
-                    break
-                # max_length caps one call: input it could not consume yet
-                # lands in unconsumed_tail and must be fed back in.
-                data = member.unconsumed_tail
-                if not data:
-                    # Input exhausted while the member is still open: the
-                    # stream is truncated. gzip.decompress raises here too.
-                    raise HTTPException(400, detail="truncated gzip body")
-    except zlib.error as exc:
+        with gzip.GzipFile(fileobj=io.BytesIO(body)) as stream:
+            out = stream.read(MAX_DECOMPRESSED_BYTES + 1)
+    except (OSError, EOFError, zlib.error) as exc:
+        # OSError covers gzip's own "Not a gzipped file" / bad CRC.
         raise HTTPException(400, detail=f"invalid gzip body: {exc}") from exc
-    return b"".join(chunks)
+    if len(out) > MAX_DECOMPRESSED_BYTES:
+        raise HTTPException(413, detail="decompressed payload too large")
+    return out
 
 
 async def _json_body(request: Request) -> dict[str, Any]:
