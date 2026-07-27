@@ -16,6 +16,7 @@ from typing import Any
 from datetime import timedelta, timezone
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from starlette.concurrency import run_in_threadpool
 
 from th2pulse.ingest.parsing import min_severity_number, parse_logs, parse_traces
 from th2pulse.ingest.store import Store
@@ -143,8 +144,13 @@ def create_app(store: Store | None = None) -> FastAPI:
         header values; encoding as UTF-8 instead produced different bytes
         and rejected a correct non-ASCII secret every single time.
         """
-        return hmac.compare_digest(provided.encode("latin-1", "replace"),
-                                   expected.encode("utf-8"))
+        try:
+            wanted = expected.encode("utf-8")
+        except UnicodeEncodeError:
+            # A secret carrying bytes os.environ could not decode: refuse
+            # rather than answer 500 on every authenticated request.
+            return False
+        return hmac.compare_digest(provided.encode("latin-1", "replace"), wanted)
 
     def _check_ingest_token(request: Request) -> None:
         if ingest_token is None:
@@ -348,9 +354,14 @@ async def _json_body(request: Request) -> dict[str, Any]:
         raise HTTPException(413, detail="payload too large")
     # The otlphttp exporter gzips payloads by default; Starlette does not
     # transparently decompress request bodies.
+    #
+    # Both the inflate and the JSON parse are CPU-bound and run on a single
+    # worker: called inline they block the event loop, so one large body
+    # stalls every other request — health checks included — for its whole
+    # duration. Off to a worker thread they go.
     if request.headers.get("content-encoding", "").lower() == "gzip":
-        body = _gunzip_bounded(body)
+        body = await run_in_threadpool(_gunzip_bounded, body)
     try:
-        return json.loads(body)
+        return await run_in_threadpool(json.loads, body)
     except ValueError as exc:
         raise HTTPException(400, detail=f"invalid JSON body: {exc}") from exc
