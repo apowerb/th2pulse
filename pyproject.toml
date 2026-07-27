@@ -1,0 +1,36 @@
+[project]
+name = "th2pulse"
+version = "0.1.0"
+description = "A lightweight OpenTelemetry collection and observability library for th2 applications."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "thaink2" }]
+dependencies = [
+    "opentelemetry-sdk>=1.35,<2",
+    "opentelemetry-exporter-otlp-proto-http>=1.35,<2",
+]
+
+[project.optional-dependencies]
+ingest = [
+    "fastapi>=0.110",
+    "uvicorn>=0.30",
+    "asyncpg>=0.29",
+]
+
+[dependency-groups]
+dev = ["pytest>=8", "httpx>=0.27"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/th2pulse"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff.lint]
+# Pin the intended rule set so a ruff release cannot repaint the repo red.
+select = ["E4", "E7", "E9", "F"]
