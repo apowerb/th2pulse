@@ -15,19 +15,27 @@ from __future__ import annotations
 import dataclasses
 import os
 import re
+from typing import Any
 
 from th2pulse.ingest.parsing import LogRow, SpanRow
 
 # Order matters: specific patterns (bearer/iban/card) before generic ones.
 MASK_PRESETS: list[tuple[str, re.Pattern[str]]] = [
     ("[masked secret]", re.compile(
-        r"(?i)(?:bearer\s+[a-z0-9._\-]{12,}|(?:api[_-]?key|secret|token|password)"
-        r"[\"']?\s*[:=]\s*[\"']?[^\s\"',}]{8,})")),
+        r"(?i)(?:bearer\s+[a-z0-9._\-]{12,4096}|(?:api[_-]?key|secret|token|password)"
+        r"[\"']?\s*[:=]\s*[\"']?[^\s\"',}]{8,4096})")),
     ("[masked iban]", re.compile(
         r"\b[A-Z]{2}\d{2}(?:[ -]?[A-Z0-9]{4}){3,7}(?:[ -]?[A-Z0-9]{1,3})?\b")),
     ("[masked card]", re.compile(r"\b(?:\d[ -]?){13,16}\d\b")),
+    # Quantifiers are bounded on purpose. Unbounded `+` runs turn quadratic on
+    # text dense in `. - _ % +`: every one of those characters is a word
+    # boundary, so each restarts a full scan that backtracks to the end
+    # looking for an `@`. Measured 8.4s on 100 KB before bounding — a single
+    # attribute value was enough to pin a worker. RFC 5321 caps the local
+    # part at 64 characters and a domain at 255, so nothing real is lost.
     ("[masked email]", re.compile(
-        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
+        r"\b[A-Za-z0-9._%+-]{1,64}@[A-Za-z0-9-]{1,63}(?:\.[A-Za-z0-9-]{1,63}){0,4}"
+        r"\.[A-Za-z]{2,24}\b")),
     ("[masked phone]", re.compile(
         r"(?<!\w)(?:\+|00)\d{1,3}(?:[ .-]?\(0\))?(?:[ .-]?\d{1,4}){3,6}(?!\w)"
         r"|(?<!\w)0\d(?:[ .-]?\d{2}){4}(?!\w)")),
@@ -59,6 +67,24 @@ def mask_text(text: str) -> str:
         return text
 
 
+def mask_value(value: Any) -> Any:
+    """Mask every string reachable inside ``value``, keeping its shape.
+
+    OTLP ``kvlistValue`` and ``arrayValue`` decode into nested dicts and
+    lists, so masking only the top level left an email or an IBAN one level
+    down perfectly readable in JSONB. Non-string leaves are returned as-is so
+    the JSONB round-trip keeps its types.
+    """
+    if isinstance(value, str):
+        return mask_text(value)
+    if isinstance(value, dict):
+        return {key: mask_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        masked = [mask_value(item) for item in value]
+        return type(value)(masked) if isinstance(value, tuple) else masked
+    return value
+
+
 def mask_log_rows(rows: list[LogRow]) -> list[LogRow]:
     """Mask the body *and* the free-form attributes of each record.
 
@@ -69,15 +95,7 @@ def mask_log_rows(rows: list[LogRow]) -> list[LogRow]:
     out: list[LogRow] = []
     for row in rows:
         body = mask_text(row.body) if row.body else row.body
-        attributes = row.attributes
-        if attributes:
-            masked = {
-                key: mask_text(value)
-                for key, value in attributes.items()
-                if isinstance(value, str)
-            }
-            if masked:
-                attributes = {**attributes, **masked}
+        attributes = mask_value(row.attributes) if row.attributes else row.attributes
         if body is not row.body or attributes is not row.attributes:
             row = dataclasses.replace(row, body=body, attributes=attributes)
         out.append(row)

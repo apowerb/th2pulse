@@ -131,11 +131,22 @@ def create_app(store: Store | None = None) -> FastAPI:
 
     app = FastAPI(title="th2pulse ingest", lifespan=lifespan)
 
+    def _token_matches(provided: str, expected: str) -> bool:
+        """Constant-time compare that survives non-ASCII input.
+
+        ``hmac.compare_digest`` raises TypeError on str arguments holding
+        non-ASCII, and a raw 0xE9 byte is perfectly legal in an HTTP header —
+        which turned a bogus token into a 500 instead of a 401. Comparing
+        UTF-8 bytes keeps the timing guarantee and the contract.
+        """
+        return hmac.compare_digest(provided.encode("utf-8", "surrogateescape"),
+                                   expected.encode("utf-8", "surrogateescape"))
+
     def _check_ingest_token(request: Request) -> None:
         if ingest_token is None:
             return
         provided = request.headers.get(INGEST_TOKEN_HEADER, "")
-        if not hmac.compare_digest(provided, ingest_token):
+        if not _token_matches(provided, ingest_token):
             raise HTTPException(401, detail="missing or invalid ingest token")
 
     def _check_query_token(request: Request) -> None:
@@ -149,7 +160,7 @@ def create_app(store: Store | None = None) -> FastAPI:
         if query_token is None:
             return
         provided = request.headers.get(QUERY_TOKEN_HEADER, "")
-        if not hmac.compare_digest(provided, query_token):
+        if not _token_matches(provided, query_token):
             raise HTTPException(401, detail="missing or invalid query token")
 
     # Applied as a route dependency rather than a parameter on each handler:
@@ -296,25 +307,35 @@ def _gunzip_bounded(body: bytes) -> bytes:
     moment the running total crosses the ceiling, so peak memory stays
     bounded by the ceiling itself rather than by the attacker's payload.
     """
-    decompressor = zlib.decompressobj(16 + zlib.MAX_WBITS)  # 16 -> gzip header
     chunks: list[bytes] = []
     produced = 0
     pending = body
     try:
-        while True:
-            chunk = decompressor.decompress(pending, _GUNZIP_CHUNK)
-            produced += len(chunk)
-            if produced > MAX_DECOMPRESSED_BYTES:
-                raise HTTPException(413, detail="decompressed payload too large")
-            if chunk:
-                chunks.append(chunk)
-            # max_length caps one call: whatever input it could not consume
-            # yet lands in unconsumed_tail and must be fed back in.
-            pending = decompressor.unconsumed_tail
-            if not pending:
-                if decompressor.eof or not chunk:
+        # A gzip stream may concatenate several members, and a decompressobj
+        # handles exactly one: once it reports eof it never consumes another
+        # byte, so reusing it silently drops the remaining members — or spins
+        # forever re-reading the same unconsumed_tail. Each member therefore
+        # gets its own decompressor, fed from the previous one's unused_data.
+        while pending:
+            member = zlib.decompressobj(16 + zlib.MAX_WBITS)  # 16 -> gzip header
+            data, pending = pending, b""
+            while True:
+                chunk = member.decompress(data, _GUNZIP_CHUNK)
+                produced += len(chunk)
+                if produced > MAX_DECOMPRESSED_BYTES:
+                    raise HTTPException(413, detail="decompressed payload too large")
+                if chunk:
+                    chunks.append(chunk)
+                if member.eof:
+                    pending = member.unused_data  # next member, if any
                     break
-                pending = b""  # keep draining output still buffered inside zlib
+                # max_length caps one call: input it could not consume yet
+                # lands in unconsumed_tail and must be fed back in.
+                data = member.unconsumed_tail
+                if not data:
+                    # Input exhausted while the member is still open: the
+                    # stream is truncated. gzip.decompress raises here too.
+                    raise HTTPException(400, detail="truncated gzip body")
     except zlib.error as exc:
         raise HTTPException(400, detail=f"invalid gzip body: {exc}") from exc
     return b"".join(chunks)
