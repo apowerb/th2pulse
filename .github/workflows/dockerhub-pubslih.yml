@@ -1,0 +1,85 @@
+name: Build and publish Docker image
+
+on:
+  workflow_run:
+    workflows: ["Upload Python Package"]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  dockerhub-publish:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release version from the PyPI workflow tag
+        id: release
+        shell: bash
+        env:
+          # Passed as an env var (not interpolated into the script body) so an
+          # attacker-controlled branch/tag name can't break out of the string
+          # and inject arbitrary shell commands into this step.
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          VERSION="${HEAD_BRANCH#v}"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        run: pip install uv
+
+      # This workflow starts as soon as "Upload Python Package" reports
+      # success, but PyPI's index takes some time to propagate a freshly
+      # published release. The Docker build below installs
+      # "th2pulse==${VERSION}" straight from PyPI via `uv pip install
+      # --system`, so building immediately is a race. Releases 0.1.11 and
+      # 0.1.12 both hit it: the build failed with "Because there is no
+      # version of th2pulse==X and you require th2pulse==X, we can conclude
+      # that your requirements are unsatisfiable", and both succeeded on
+      # manual re-run once PyPI had caught up.
+      #
+      # This step runs the same `uv pip install --dry-run --system` the
+      # Dockerfile runs, so it fails and succeeds under exactly the
+      # condition the real build depends on. Polling PyPI's JSON metadata
+      # endpoint instead (an earlier version of this fix did) would check a
+      # different code path than the Simple index the resolver reads, and
+      # could report "available" before the resolver agrees.
+      - name: Wait for the release to resolve on PyPI
+        shell: bash
+        env:
+          PACKAGE_NAME: th2pulse
+          PACKAGE_VERSION: ${{ steps.release.outputs.version }}
+        run: .github/scripts/wait-for-pypi-release.sh
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+        with:
+          cache-image: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            apowerb/th2pulse:${{ steps.release.outputs.version }}
+            apowerb/th2pulse:latest
