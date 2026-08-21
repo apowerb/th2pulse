@@ -138,10 +138,34 @@ cannot duplicate committed rows) and span inserts are idempotent
 (`ON CONFLICT DO NOTHING`), so replaying an OTLP export is safe.
 `user_id` narrows every query to one user's conversations — callers doing
 authorization (e.g. a frontend proxy) should inject it server-side from a
-verified identity, never from client input. Optional hardening on top of
-the localhost-only bind: set `TH2PULSE_INGEST_TOKEN` and the POST
-endpoints require a matching `X-Th2Pulse-Token` header; payloads are
+verified identity, never from client input. Set `TH2PULSE_INGEST_TOKEN`
+and the POST endpoints require a matching `X-Th2Pulse-Token` header;
+`TH2PULSE_QUERY_TOKEN` does the same for the read side. Payloads are
 capped (10 MB raw, 32 MB decompressed).
+
+Both tokens are optional *while the bind stays on loopback*, where the
+socket is the boundary. On any other bind address they are not: the
+service refuses to start with `TH2PULSE_INGEST_HOST` set to something
+reachable and either token missing, rather than quietly serving
+conversation logs and recorded tool arguments to whoever reaches the
+port. Set `TH2PULSE_ALLOW_UNAUTHENTICATED=1` to state that authorization
+is handled upstream (a reverse proxy, a private network).
+
+### Docker
+
+```bash
+docker run -p 4319:4319 \
+  -e TH2PULSE_DB_DSN="postgresql://user:pass@host:5432/db" \
+  -e TH2PULSE_INGEST_TOKEN="..." -e TH2PULSE_QUERY_TOKEN="..." \
+  apowerb/th2pulse:latest
+```
+
+The image binds `0.0.0.0:4319` — a container's loopback reaches nothing —
+which is why the tokens above are not optional here. It installs the
+published release matching its tag, so `apowerb/th2pulse:0.1.3` contains
+th2pulse 0.1.3; it is not built from the working tree. To run a local
+change, run the service directly instead:
+`uv run --extra ingest python -m th2pulse.ingest`.
 
 The conversation map is built from `gen_ai.conversation.id` / `user.id`
 attributes — on spans (where ADK puts them natively) and on log records

@@ -27,12 +27,26 @@ jobs:
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
           VERSION="${HEAD_BRANCH#v}"
+          # head_branch is the only place this workflow can read the release
+          # tag from, and for a workflow_run event it is not guaranteed to be
+          # one: it can carry a branch name instead. That used to cost a
+          # mislabelled tag; it now decides what the image actually installs
+          # (TH2PULSE_VERSION below), and a non-version value would burn the
+          # 15-minute PyPI wait before failing. Fail here instead, saying why.
+          # [[ =~ ]] rather than grep: grep anchors per line, so a value
+          # with an embedded newline would slip through on its first line.
+          if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([abrc.dev+-][0-9A-Za-z.+-]*)?$ ]]; then
+            echo "::error::Resolved '${VERSION}' from workflow_run.head_branch, which is not a release version. Expected the publish workflow to have run from a tag like v0.1.3."
+            exit 1
+          fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.13"
+          # Same interpreter as the Dockerfile's base image, so the wait step
+          # below resolves against the same set of wheels the build will.
+          python-version: "3.11"
 
       - name: Install uv
         run: pip install uv
@@ -40,23 +54,23 @@ jobs:
       # This workflow starts as soon as "Upload Python Package" reports
       # success, but PyPI's index takes some time to propagate a freshly
       # published release. The Docker build below installs
-      # "th2pulse==${VERSION}" straight from PyPI via `uv pip install
-      # --system`, so building immediately is a race. Releases 0.1.11 and
-      # 0.1.12 both hit it: the build failed with "Because there is no
+      # "th2pulse[ingest]==${VERSION}" straight from PyPI, so building
+      # immediately is a race: the resolver reports "Because there is no
       # version of th2pulse==X and you require th2pulse==X, we can conclude
-      # that your requirements are unsatisfiable", and both succeeded on
-      # manual re-run once PyPI had caught up.
+      # that your requirements are unsatisfiable". Cutting 0.1.2 by hand hit
+      # exactly that, and a retry a minute later resolved.
       #
-      # This step runs the same `uv pip install --dry-run --system` the
-      # Dockerfile runs, so it fails and succeeds under exactly the
-      # condition the real build depends on. Polling PyPI's JSON metadata
-      # endpoint instead (an earlier version of this fix did) would check a
-      # different code path than the Simple index the resolver reads, and
-      # could report "available" before the resolver agrees.
+      # This step runs the same resolution the Dockerfile runs, so it fails
+      # and succeeds under exactly the condition the real build depends on.
+      # Polling PyPI's JSON metadata endpoint instead would check a different
+      # code path than the Simple index the resolver reads, and could report
+      # "available" before the resolver agrees.
       - name: Wait for the release to resolve on PyPI
         shell: bash
         env:
-          PACKAGE_NAME: th2pulse
+          # Same requirement string the Dockerfile installs, extras
+          # included, so this step resolves exactly what the build will.
+          PACKAGE_NAME: th2pulse[ingest]
           PACKAGE_VERSION: ${{ steps.release.outputs.version }}
         run: .github/scripts/wait-for-pypi-release.sh
 
@@ -80,6 +94,8 @@ jobs:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
+          build-args: |
+            TH2PULSE_VERSION=${{ steps.release.outputs.version }}
           tags: |
             apowerb/th2pulse:${{ steps.release.outputs.version }}
             apowerb/th2pulse:latest
