@@ -118,7 +118,7 @@ Run it:
 ```bash
 pip install "th2pulse[ingest]"
 export TH2PULSE_DB_DSN="postgresql://user:pass@host:5432/db?sslmode=require"
-export TH2PULSE_DB_SCHEMA="my_schema"        # optional
+export TH2PULSE_DB_SCHEMA="my_schema"        # optional, created if absent
 python -m th2pulse.ingest                     # 127.0.0.1:4319
 ```
 
