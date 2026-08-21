@@ -12,11 +12,11 @@ ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
 # Install dependencies using uv
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-dev
 
 # Copy source code
-COPY . .
+COPY src/ ./src/
 
 # Run the application
 CMD ["uv", "run", "python", "-m", "th2pulse.ingest"]
