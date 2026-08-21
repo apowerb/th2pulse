@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -301,10 +302,22 @@ _PRUNE_ALERTS = (
 )
 
 
+# A schema name cannot be passed as a query parameter -- PostgreSQL takes
+# identifiers, not values -- so it is interpolated into the DDL below. It
+# arrives from TH2PULSE_DB_SCHEMA, i.e. from a deployment's environment, so it
+# is validated first rather than quoted and hoped for.
+_PLAIN_IDENTIFIER = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
 class Store:
     """Thin asyncpg wrapper. ``schema`` scopes every table via search_path."""
 
     def __init__(self, dsn: str, schema: str | None = None) -> None:
+        if schema and not _PLAIN_IDENTIFIER.match(schema):
+            raise ValueError(
+                f"TH2PULSE_DB_SCHEMA={schema!r} is not a plain identifier "
+                "(letters, digits and underscore, not starting with a digit)."
+            )
         self._dsn = dsn
         self._schema = schema
         self._pool: asyncpg.Pool | None = None
@@ -322,6 +335,18 @@ class Store:
         async with self._pool.acquire() as conn:
             await conn.execute("SELECT pg_advisory_lock($1)", self._DDL_LOCK_KEY)
             try:
+                if self._schema:
+                    # search_path only *selects* a schema, it does not create
+                    # one. Without this, pointing TH2PULSE_DB_SCHEMA at a
+                    # schema that does not exist yet fails startup with
+                    # "no schema has been selected to create in" -- which
+                    # reads like a configuration typo rather than the missing
+                    # CREATE it actually is. Measured deploying this service
+                    # next to an application in a shared database, where
+                    # giving it a schema of its own is the normal thing to do.
+                    await conn.execute(
+                        f'CREATE SCHEMA IF NOT EXISTS "{self._schema}"'
+                    )
                 await conn.execute(_DDL)
             finally:
                 await conn.execute("SELECT pg_advisory_unlock($1)", self._DDL_LOCK_KEY)
