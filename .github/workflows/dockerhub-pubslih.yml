@@ -13,6 +13,22 @@ jobs:
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
 
+    services:
+      # Only used by the smoke test below, which needs a database to get
+      # past application startup and answer /healthz.
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: smoke
+          POSTGRES_DB: smoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -87,6 +103,29 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      # Built for this runner's architecture only, and loaded rather than
+      # pushed, so the next step can run it. The multi-arch build below
+      # reuses these layers from cache, so this is not a second full build.
+      - name: Build image for the smoke test
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          build-args: |
+            TH2PULSE_VERSION=${{ steps.release.outputs.version }}
+          tags: th2pulse:smoke
+
+      # The step that was missing. Nothing in this pipeline used to run the
+      # image it publishes, so 0.1.2 shipped unable to start at all: the
+      # build passing was read as the release working.
+      - name: Smoke-test the image before publishing it
+        env:
+          IMAGE: th2pulse:smoke
+          EXPECTED_VERSION: ${{ steps.release.outputs.version }}
+          DB_DSN: postgresql://postgres:smoke@127.0.0.1:5432/smoke
+        run: .github/scripts/smoke-test-image.sh
 
       - name: Build and push image
         uses: docker/build-push-action@v6
