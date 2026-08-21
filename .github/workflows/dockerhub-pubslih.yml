@@ -53,12 +53,12 @@ jobs:
       # endpoint instead (an earlier version of this fix did) would check a
       # different code path than the Simple index the resolver reads, and
       # could report "available" before the resolver agrees.
-      - name: Wait for the release to resolve on PyPI
-        shell: bash
-        env:
-          PACKAGE_NAME: th2pulse
-          PACKAGE_VERSION: ${{ steps.release.outputs.version }}
-        run: .github/scripts/wait-for-pypi-release.sh
+    #   - name: Wait for the release to resolve on PyPI
+    #     shell: bash
+    #     env:
+    #       PACKAGE_NAME: th2pulse
+    #       PACKAGE_VERSION: ${{ steps.release.outputs.version }}
+    #     run: .github/scripts/wait-for-pypi-release.sh
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
