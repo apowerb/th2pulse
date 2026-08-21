@@ -4,15 +4,16 @@
 #
 # Why this exists: the Docker publish workflow runs on workflow_run of the
 # PyPI publish workflow completing, then the Dockerfile immediately runs
-# `uv pip install --system --no-cache-dir "th2pulse==$VERSION"`. PyPI's
+# `uv pip install --no-cache-dir "th2pulse[ingest]==$VERSION"`. PyPI's
 # index takes some time to propagate a freshly published release, so
-# building right away is a race. Releases 0.1.11 and 0.1.12 both failed the
-# Docker build with:
+# building right away is a race, failing with:
 #
 #   Because there is no version of th2pulse==X and you require
 #   th2pulse==X, we can conclude that your requirements are unsatisfiable.
 #
-# and both succeeded on manual re-run once PyPI had caught up.
+# This guard is ported from apowerb/apowerb, where releases 0.1.11 and 0.1.12
+# both hit that race and both succeeded on manual re-run once PyPI had caught
+# up. Cutting th2pulse 0.1.2 by hand hit it too.
 #
 # This script runs the exact same class of command the Dockerfile runs
 # (`uv pip install --dry-run --system`), so it fails and succeeds under the
@@ -25,8 +26,9 @@
 # or downloading anything.
 #
 # Required env vars:
-#   PACKAGE_NAME     - PyPI project name, e.g. th2pulse
-#   PACKAGE_VERSION  - exact release version to wait for, e.g. 0.1.12
+#   PACKAGE_NAME     - PyPI project name, extras included if the build
+#                      installs them, e.g. th2pulse[ingest]
+#   PACKAGE_VERSION  - exact release version to wait for, e.g. 0.1.3
 # Optional env vars:
 #   MAX_ATTEMPTS     - default 90
 #   SLEEP_SECONDS    - default 10
@@ -37,11 +39,11 @@ set -euo pipefail
 
 : "${PACKAGE_NAME:?PACKAGE_NAME is required}"
 : "${PACKAGE_VERSION:?PACKAGE_VERSION is required}"
-# 90 x 10s = 15 minutes. The first budget was 5 minutes and it was not enough:
-# the 0.1.13 release exhausted all 30 attempts on 2026-08-05 and failed the
-# publish, while 0.1.11 and 0.1.12 had resolved comfortably inside it earlier
-# the same day. Propagation time is not a constant, so the budget is sized for
-# the slow case rather than the median.
+# 90 x 10s = 15 minutes. In apowerb/apowerb, where this budget was tuned, the
+# first one was 5 minutes and it was not enough: the 0.1.13 release exhausted
+# all 30 attempts on 2026-08-05 and failed the publish, while 0.1.11 and 0.1.12
+# had resolved comfortably inside it earlier the same day. Propagation time is
+# not a constant, so the budget is sized for the slow case, not the median.
 #
 # A wide budget costs nothing when propagation is quick -- the loop exits on
 # the first successful resolution, it does not wait out its allowance.
