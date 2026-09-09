@@ -3,7 +3,8 @@ name = "th2pulse"
 version = "0.1.0"
 description = "A lightweight OpenTelemetry collection and observability library for th2 applications."
 readme = "README.md"
-license = { text = "MIT" }
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.11"
 authors = [{ name = "thaink2" }]
 dependencies = [
