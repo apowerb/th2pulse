@@ -200,3 +200,11 @@ uv run pytest
 * Traces/metrics bootstrap for non-ADK services (FastAPI instrumentation).
 * Span storage + retention policies in the ingest service.
 * Structured redaction presets shared across th2 services.
+
+## License
+
+th2pulse is distributed under the [Apache License 2.0](./LICENSE).
+Copyright 2025-2026 thaink².
+
+"apowerb" and "thaink²" are trademarks of thaink². The licence covers the code,
+not the marks — see [TRADEMARK.md](https://github.com/apowerb/apowerb/blob/main/TRADEMARK.md).
