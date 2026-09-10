@@ -4,13 +4,31 @@ on:
   workflow_run:
     workflows: ["Upload Python Package"]
     types: [completed]
+  # Republier l'image d'une release deja sur PyPI -- typiquement apres une
+  # correction qui ne touche que le Dockerfile, comme le passage a Debian 13.
+  # Sans cela, un correctif de base ne peut pas atteindre l'image publiee : il
+  # faudrait couper une release applicative pour livrer un changement qui n'en
+  # est pas une.
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version deja publiee sur PyPI a reconstruire, par ex. 0.1.4"
+        required: true
+      publish:
+        description: "Pousser l'image sur Docker Hub. Decocher pour un essai qui construit et teste seulement."
+        type: boolean
+        default: true
 
 permissions:
   contents: read
 
 jobs:
   dockerhub-publish:
-    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    # En workflow_run, on n'enchaine que sur une publication PyPI reussie.
+    # En dispatch, il n'y a pas de run amont a juger.
+    if: >-
+      ${{ github.event_name == 'workflow_dispatch'
+          || github.event.workflow_run.conclusion == 'success' }}
     runs-on: ubuntu-latest
 
     services:
@@ -41,8 +59,16 @@ jobs:
           # attacker-controlled branch/tag name can't break out of the string
           # and inject arbitrary shell commands into this step.
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+          DISPATCH_VERSION: ${{ github.event.inputs.version }}
         run: |
-          VERSION="${HEAD_BRANCH#v}"
+          # En dispatch, la version est donnee explicitement ; head_branch n'a
+          # alors aucun sens. Le controle de format ci-dessous s'applique aux
+          # deux chemins : une saisie manuelle se trompe aussi bien qu'un tag.
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            VERSION="${DISPATCH_VERSION#v}"
+          else
+            VERSION="${HEAD_BRANCH#v}"
+          fi
           # head_branch is the only place this workflow can read the release
           # tag from, and for a workflow_run event it is not guaranteed to be
           # one: it can carry a branch name instead. That used to cost a
@@ -52,7 +78,7 @@ jobs:
           # [[ =~ ]] rather than grep: grep anchors per line, so a value
           # with an embedded newline would slip through on its first line.
           if [[ ! "${VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([abrc.dev+-][0-9A-Za-z.+-]*)?$ ]]; then
-            echo "::error::Resolved '${VERSION}' from workflow_run.head_branch, which is not a release version. Expected the publish workflow to have run from a tag like v0.1.3."
+            echo "::error::Resolved '${VERSION}' from the ${{ github.event_name }} event, which is not a release version. Expected something like 0.1.4."
             exit 1
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
@@ -131,7 +157,10 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
+          # Un enchainement sur release pousse toujours ; un dispatch obeit a
+          # sa case. L'essai a blanc construit et passe le smoke test sans
+          # rien publier.
+          push: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
           platforms: linux/amd64,linux/arm64
           build-args: |
             TH2PULSE_VERSION=${{ steps.release.outputs.version }}
