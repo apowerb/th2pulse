@@ -81,6 +81,26 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 
+# pip et setuptools ne servent jamais a l'execution : le service tourne dans
+# /opt/venv, construit par uv, qui n'embarque ni l'un ni l'autre. Les copies de
+# l'image de base vendorisent leur propre arbre de dependances sous
+# `setuptools/_vendor/`, et c'est CET arbre -- pas les dependances de
+# l'application -- que visent les deux derniers avis Python de cette image,
+# `wheel` (CVE-2026-24049) et `jaraco.context` (CVE-2026-23949). Verifie :
+# aucun des deux n'a de `dist-info` dans /opt/venv.
+#
+# Pour qui etend cette image : `pip` n'est plus la. Utiliser uv, deja present
+# dans /bin, ou lancer `python -m ensurepip` d'abord.
+#
+# Le coeur apowerb (apowerb/apowerb#137) et th2etl (#24) font de meme.
+RUN /usr/local/bin/python -m pip uninstall -y pip setuptools \
+    && rm -rf /usr/local/lib/python3.11/site-packages/pip* \
+              /usr/local/lib/python3.11/site-packages/setuptools* \
+              /usr/local/lib/python3.11/site-packages/pkg_resources \
+              /usr/local/lib/python3.11/site-packages/_distutils_hack \
+              /usr/local/lib/python3.11/site-packages/distutils-precedence.pth \
+              /usr/local/lib/python3.11/site-packages/wheel*
+
 # The library binds 127.0.0.1 by default, which is right for a process
 # started on a developer machine and useless inside a container: nothing
 # outside the container could reach it. Reaching past loopback is also what
