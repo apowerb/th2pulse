@@ -42,6 +42,24 @@ RUN test -n "${TH2PULSE_VERSION}" \
     || { echo "TH2PULSE_VERSION build-arg is required, e.g. --build-arg TH2PULSE_VERSION=0.1.3" >&2; exit 1; } \
     && uv pip install --no-cache-dir "th2pulse[ingest]==${TH2PULSE_VERSION}"
 
+# perl-base est un paquet Essential de l'image de base python:3.11-slim-trixie :
+# rien au-dessus ne le tire, et cette image n'installe aucun paquet systeme.
+# Il porte a lui seul les trois dernieres vulnerabilites critiques mesurees le
+# 11/09 sur l'image publiee -- CVE-2026-13221, CVE-2026-42496, CVE-2026-8376 --
+# sans correctif publie pour cette version de Debian. Un service Python pur ne
+# l'execute jamais.
+#
+# Pour qui etend cette image : `apt-get install` continue de fonctionner pour
+# les paquets ordinaires, et un paquet dont les scripts de maintenance sont en
+# Perl le reinstallera comme n'importe quelle dependance manquante.
+#
+# th2etl a fait la meme purge (PR #22) et se mesure desormais a zero critique.
+RUN apt-get update \
+    && apt-get purge -y --allow-remove-essential perl-base \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
+
 # The library binds 127.0.0.1 by default, which is right for a process
 # started on a developer machine and useless inside a container: nothing
 # outside the container could reach it. Reaching past loopback is also what
