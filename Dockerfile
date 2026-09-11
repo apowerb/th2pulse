@@ -59,6 +59,27 @@ RUN apt-get update \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
+# Meme raisonnement, meme image de base, cette fois pour util-linux et les
+# paquets construits depuis la meme source (mount, login, bsdutils). Ils
+# portent quatre avis HIGH -- CVE-2026-76642, -78408, -78409, -78410 -- sur des
+# aides de montage qui tournent des post-hooks privilegies, sur
+# `nsenter --join-cgroup` et sur la resolution de chemins X-mount. Ce service
+# n'execute rien de tout cela : le CMD est du Python pur, et ni uv ni le paquet
+# installe n'appellent mount, login, su ou nsenter.
+#
+# `apt-get autoremove` emporte ensuite libblkid1, libmount1, libsmartcols1 et
+# liblastlog2-2, devenus orphelins. libuuid1 reste, et les avis continueront de
+# lui etre attribues : un scanner rattache une CVE de source a tous les paquets
+# binaires qui en sortent, mais le code vulnerable -- les aides de montage --
+# est parti avec les binaires ci-dessus.
+#
+# Le coeur apowerb applique exactement cette purge (PR #137), mesuree a
+# 49 avis HIGH contre 15.
+RUN apt-get update \
+    && apt-get purge -y --allow-remove-essential util-linux mount login bsdutils \
+    && apt-get autoremove -y \
+    && rm -rf /var/lib/apt/lists/*
+
 
 # The library binds 127.0.0.1 by default, which is right for a process
 # started on a developer machine and useless inside a container: nothing
