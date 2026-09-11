@@ -164,6 +164,12 @@ jobs:
           platforms: linux/amd64,linux/arm64
           build-args: |
             TH2PULSE_VERSION=${{ steps.release.outputs.version }}
+          # :latest seulement pour une vraie release. Un workflow_dispatch
+          # d'une version anterieure -- reconstruire 0.1.2 sur une base
+          # corrigee, par exemple -- ferait sinon RECULER :latest, et toute
+          # installation qui ne fixe pas le tag suivrait la descente sans le
+          # moindre signal. Corrige un defaut de la PR #8, qui avait repris le
+          # declencheur de th2etl sans reprendre cette garde.
           tags: |
             apowerb/th2pulse:${{ steps.release.outputs.version }}
-            apowerb/th2pulse:latest
+            ${{ github.event_name == 'workflow_run' && 'apowerb/th2pulse:latest' || '' }}
