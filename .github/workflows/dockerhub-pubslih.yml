@@ -60,6 +60,8 @@ jobs:
           # and inject arbitrary shell commands into this step.
           HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
           DISPATCH_VERSION: ${{ github.event.inputs.version }}
+          # Pour lire la release la plus recente dans le script ci-dessous.
+          GH_TOKEN: ${{ github.token }}
         run: |
           # En dispatch, la version est donnee explicitement ; head_branch n'a
           # alors aucun sens. Le controle de format ci-dessous s'applique aux
@@ -82,6 +84,31 @@ jobs:
             exit 1
           fi
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+          # Faut-il faire suivre :latest ? Sur un workflow_run, oui : c'est une
+          # vraie release. Sur un dispatch, seulement si la version reconstruite
+          # EST deja la plus recente publiee -- reconstruire 0.1.2 ne doit pas
+          # faire reculer :latest, mais reconstruire la derniere sur une base
+          # corrigee doit le faire suivre, sinon `docker pull` sans tag continue
+          # de servir l'image d'avant. Vecu le 11/09/2026 : une release coupee
+          # pendant qu'un correctif etait en vol a laisse :latest sur l'image
+          # vulnerable, la version corrigee etant publiee juste a cote.
+          #
+          # En cas de doute -- appel API en echec, aucune release -- on ne bouge
+          # pas :latest : ne rien faire est le comportement sur.
+          if [ "${{ github.event_name }}" = "workflow_run" ]; then
+            echo "move_latest=true" >> "$GITHUB_OUTPUT"
+          else
+            NEWEST=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" --jq .tag_name 2>/dev/null || echo "")
+            NEWEST="${NEWEST#v}"
+            if [ -n "${NEWEST}" ] && [ "${NEWEST}" = "${VERSION}" ]; then
+              echo "move_latest=true" >> "$GITHUB_OUTPUT"
+              echo "${VERSION} est la release la plus recente : :latest suivra."
+            else
+              echo "move_latest=false" >> "$GITHUB_OUTPUT"
+              echo "release la plus recente = '${NEWEST:-inconnue}', demandee = '${VERSION}' : :latest ne bouge pas."
+            fi
+          fi
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -172,4 +199,4 @@ jobs:
           # declencheur de th2etl sans reprendre cette garde.
           tags: |
             apowerb/th2pulse:${{ steps.release.outputs.version }}
-            ${{ github.event_name == 'workflow_run' && 'apowerb/th2pulse:latest' || '' }}
+            ${{ steps.release.outputs.move_latest == 'true' && 'apowerb/th2pulse:latest' || '' }}
