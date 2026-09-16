@@ -1,4 +1,25 @@
+<div align="center">
+
+<img src="https://avatars.githubusercontent.com/u/310538280?v=4&s=160" alt="apowerb" width="96" />
+
 # th2pulse
+
+**A lightweight OpenTelemetry collection and observability library for the apowerb stack.**
+
+[![Documentation](https://img.shields.io/badge/docs-apowerb.com-blue?style=for-the-badge&logo=googledocs&logoColor=white)](https://docs.apowerb.com/)
+[![PyPI version](https://img.shields.io/pypi/v/th2pulse?style=for-the-badge&logo=pypi&logoColor=white)](https://pypi.org/project/th2pulse/)
+[![Python](https://img.shields.io/badge/Python-3.12%20%7C%203.13-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-Apache_2.0-green.svg?style=for-the-badge)](LICENSE)
+
+<p align="center">
+  <a href="https://docs.apowerb.com/">Documentation</a> •
+  <a href="https://github.com/apowerb/apowerb">apowerb</a> •
+  <a href="https://thaink2.com">thaink2</a>
+</p>
+
+</div>
+
+---
 
 A lightweight OpenTelemetry collection and observability library for th2
 applications (th2agent, th2llm, th2etl).
