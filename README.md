@@ -9,7 +9,7 @@
 [![Documentation](https://img.shields.io/badge/docs-apowerb.com-blue?style=for-the-badge&logo=googledocs&logoColor=white)](https://docs.apowerb.com/)
 [![PyPI version](https://img.shields.io/pypi/v/th2pulse?style=for-the-badge&logo=pypi&logoColor=white)](https://pypi.org/project/th2pulse/)
 [![Python](https://img.shields.io/badge/Python-3.12%20%7C%203.13-3776AB?style=for-the-badge&logo=python&logoColor=white)](https://www.python.org/)
-[![License](https://img.shields.io/badge/License-Apache_2.0-green.svg?style=for-the-badge)](LICENSE)
+[![License](https://img.shields.io/badge/License-Apache_2.0-green.svg?style=for-the-badge)](https://github.com/apowerb/th2pulse/blob/main/LICENSE)
 
 <p align="center">
   <a href="https://docs.apowerb.com/">Documentation</a> •
@@ -224,7 +224,7 @@ uv run pytest
 
 ## License
 
-th2pulse is distributed under the [Apache License 2.0](./LICENSE).
+th2pulse is distributed under the [Apache License 2.0](https://github.com/apowerb/th2pulse/blob/main/LICENSE).
 Copyright 2025-2026 thaink².
 
 "apowerb" and "thaink²" are trademarks of thaink². The licence covers the code,
