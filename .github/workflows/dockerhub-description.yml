@@ -9,7 +9,7 @@ on:
   push:
     branches: [main]
     paths:
-      - .github/DOCKERHUB.md
+      - README.md
       - .github/workflows/dockerhub-description.yml
   workflow_dispatch:
 
@@ -24,7 +24,7 @@ jobs:
 
       - name: Verifier la limite Docker Hub
         run: |
-          n=$(wc -c < .github/DOCKERHUB.md)
+          n=$(wc -c < README.md)
           echo "description : $n caracteres"
           if [ "$n" -gt 25000 ]; then
             echo "::error::La description depasse la limite Docker Hub de 25000 caracteres."
@@ -37,5 +37,5 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
           repository: apowerb/th2pulse
-          readme-filepath: .github/DOCKERHUB.md
+          readme-filepath: README.md
           short-description: ${{ github.event.repository.description }}
