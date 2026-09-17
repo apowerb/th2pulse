@@ -22,7 +22,7 @@
 ---
 
 A lightweight OpenTelemetry collection and observability library for th2
-applications (th2agent, th2llm, th2etl).
+applications (apowerb, th2llm, th2etl).
 
 ## Why
 
@@ -66,7 +66,7 @@ installed (ADK's own telemetry is already flowing at that point):
 
 ```python
 app = get_fast_api_app(...)
-th2pulse.init_observability("th2agent")
+th2pulse.init_observability("apowerb")
 ```
 
 ### In a plain FastAPI service / worker / script
