@@ -54,7 +54,11 @@ RUN test -n "${TH2PULSE_VERSION}" \
 # Perl le reinstallera comme n'importe quelle dependance manquante.
 #
 # th2etl a fait la meme purge (PR #22) et se mesure desormais a zero critique.
+# `apt-get upgrade` prend les correctifs de securite Debian publies apres la
+# derniere image de base (gzip, pcre2, sqlite, openssl releves le 15/10 sur
+# l'image du 11/09), au lieu d'attendre sa reconstruction.
 RUN apt-get update \
+    && apt-get upgrade -y \
     && apt-get purge -y --allow-remove-essential perl-base \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
