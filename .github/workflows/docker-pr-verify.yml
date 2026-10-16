@@ -1,0 +1,121 @@
+name: Build and verify Docker image (PR)
+
+# Le workflow de publication ne tourne qu'apres une release PyPI, et pousse :
+# un Dockerfile casse, ou une purge de paquets qui retire une bibliotheque
+# encore utilisee, n'apparaissait qu'au moment de publier. Celui-ci construit
+# l'image sur chaque PR qui la touche, sans rien pousser, et la passe au meme
+# smoke test que la publication, plus deux controles propres a la purge et un
+# rapport Trivy.
+#
+# L'image installe la derniere version deja publiee sur PyPI (le Dockerfile n'a
+# pas de chemin pour construire depuis les sources) : ce job verifie la
+# mecanique du Dockerfile, pas le code Python de la PR, que les tests couvrent.
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - .dockerignore
+      - pyproject.toml
+      - uv.lock
+      - .github/scripts/smoke-test-image.sh
+      - .github/workflows/docker-pr-verify.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  docker-pr-verify:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: smoke
+          POSTGRES_USER: postgres
+          POSTGRES_DB: smoke
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve the latest version published on PyPI
+        id: pypi
+        run: |
+          VERSION=$(curl -sf https://pypi.org/pypi/th2pulse/json | python3 -c "import json,sys; print(json.load(sys.stdin)['info']['version'])")
+          test -n "$VERSION"
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build image (local only, no push)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          platforms: linux/amd64
+          build-args: |
+            TH2PULSE_VERSION=${{ steps.pypi.outputs.version }}
+          tags: th2pulse:pr-verify
+
+      - name: Smoke-test the image (same script as the release)
+        env:
+          IMAGE: th2pulse:pr-verify
+          EXPECTED_VERSION: ${{ steps.pypi.outputs.version }}
+          DB_DSN: postgresql://postgres:smoke@127.0.0.1:5432/smoke
+        run: .github/scripts/smoke-test-image.sh
+
+      # Le Dockerfile purge libuuid1 et ncurses : ils doivent rester absents et
+      # plus aucun objet partage de l'image ne doit les lier, sinon l'echec
+      # n'apparaitrait qu'a l'import ou a l'appel, en production.
+      - name: Purged libraries have no consumer left
+        run: |
+          set -e
+          docker run --rm --entrypoint sh th2pulse:pr-verify -c '
+            for pkg in libuuid1 libncursesw6 ncurses-bin ncurses-base; do
+              if dpkg-query -W -f="\${Status}" "$pkg" 2>/dev/null | grep -q "ok installed"; then
+                echo "FAIL: $pkg is installed"; exit 1
+              fi
+            done
+            broken=$(find / -xdev -type f \( -name "*.so" -o -name "*.so.*" \) 2>/dev/null \
+              | while read -r f; do
+                  ldd "$f" 2>/dev/null | grep -Eq "lib(uuid|ncursesw|formw|menuw|panelw)\.so[^ ]* => not found" && echo "$f"
+                done || true)
+            if [ -n "$broken" ]; then echo "FAIL: still linked against a purged library:"; echo "$broken"; exit 1; fi
+            echo "OK: purged packages absent, no shared object links them"
+          '
+          docker run --rm th2pulse:pr-verify python -c "
+          import uuid
+          assert uuid.uuid4().version == 4 and uuid.uuid1().version == 1
+          import readline
+          print('OK: uuid1/uuid4 and readline work without libuuid1 / libncursesw6')
+          "
+
+      # Meme scanner et meme version que les mesures consignees pour cette
+      # image, pour que les chiffres se comparent. Echoue si le scanner ne tourne pas,
+      # jamais sur les failles trouvees : les HIGH restants sont des paquets
+      # Debian sans correctif publie.
+      - name: Trivy scan of the built image (CRITICAL, HIGH)
+        run: |
+          set -e
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/out" aquasec/trivy:0.68.1 \
+            image -q --severity CRITICAL,HIGH --format json -o /out/trivy-th2pulse.json th2pulse:pr-verify
+          docker run --rm -v "$PWD:/out" aquasec/trivy:0.68.1 convert -q --format table /out/trivy-th2pulse.json
+
+      - name: Upload the Trivy report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-th2pulse
+          path: trivy-th2pulse.json
+          if-no-files-found: ignore
