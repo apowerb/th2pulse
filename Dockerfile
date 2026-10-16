@@ -99,7 +99,7 @@ RUN apt-get update \
 # Seuls ncurses-bin et ncurses-base sont Essential et demandent le forcage.
 #
 # Restent : libtinfo6 (bash, readline), libacl1 (coreutils, tar, passwd),
-# libsystemd0 et libudev1 (apt, PAM) -- les quatre HIGH qui demeurent.
+# libsystemd0 (apt, PAM) -- les trois HIGH qui demeurent ; libudev1 part plus bas.
 #
 # Pour qui etend cette image : `docker exec -it ... bash` marche toujours, mais
 # sans terminfo, `clear` et `tput` disparaissent et les programmes plein ecran
@@ -110,6 +110,12 @@ RUN dpkg --purge libuuid1 libncursesw6 \
     && dpkg --purge --force-remove-essential ncurses-bin ncurses-base \
     && rm -f /usr/local/lib/python3.11/lib-dynload/_uuid.* \
              /usr/local/lib/python3.11/lib-dynload/_curses*
+
+# libudev1 (systemd CVE-2026-16742, sans correctif trixie) a perdu son dernier
+# consommateur avec util-linux ci-dessus : apt depend de libsystemd0, pas de
+# libudev1, donc apt reste installe et `apt-get install` marche toujours. dpkg
+# refuse la purge si un changement ulterieur ramene un consommateur.
+RUN dpkg --purge libudev1
 
 
 # pip et setuptools ne servent jamais a l'execution : le service tourne dans
