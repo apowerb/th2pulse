@@ -84,6 +84,33 @@ RUN apt-get update \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
 
+# libuuid1 et ncurses (libncursesw6, ncurses-bin, ncurses-base) portent sept des
+# onze avis HIGH restants -- util-linux CVE-2026-76642, -78408, -78409, -78410
+# et ncurses CVE-2025-69720 --, sans correctif Debian trixie publie (Trivy
+# 0.68.1, 16/10/2026). Rien a l'execution n'en a besoin : libuuid1 a perdu son
+# dernier dependant avec util-linux ci-dessus, et seuls les modules `_uuid` et
+# `_curses` de Python lient ces bibliotheques. Ils partent avec : `import uuid`
+# prend son chemin pur Python (uuid4 lit os.urandom, uuid1 tire un noeud
+# aleatoire) et `import curses` echoue en ImportError au lieu d'un .so orphelin.
+#
+# dpkg --purge, pas `apt-get purge --allow-remove-essential` : dpkg refuse de
+# retirer un paquet dont un autre depend, donc si un changement ulterieur tire un
+# consommateur, la construction echoue ici au lieu qu'apt emporte la cascade.
+# Seuls ncurses-bin et ncurses-base sont Essential et demandent le forcage.
+#
+# Restent : libtinfo6 (bash, readline), libacl1 (coreutils, tar, passwd),
+# libsystemd0 et libudev1 (apt, PAM) -- les quatre HIGH qui demeurent.
+#
+# Pour qui etend cette image : `docker exec -it ... bash` marche toujours, mais
+# sans terminfo, `clear` et `tput` disparaissent et les programmes plein ecran
+# retombent sur un terminal muet. `apt-get install ncurses-base` les rend.
+#
+# Le coeur apowerb applique la meme purge.
+RUN dpkg --purge libuuid1 libncursesw6 \
+    && dpkg --purge --force-remove-essential ncurses-bin ncurses-base \
+    && rm -f /usr/local/lib/python3.11/lib-dynload/_uuid.* \
+             /usr/local/lib/python3.11/lib-dynload/_curses*
+
 
 # pip et setuptools ne servent jamais a l'execution : le service tourne dans
 # /opt/venv, construit par uv, qui n'embarque ni l'un ni l'autre. Les copies de
