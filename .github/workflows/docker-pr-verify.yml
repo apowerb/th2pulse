@@ -102,15 +102,15 @@ jobs:
           "
 
       # Meme scanner et meme version que les mesures consignees pour cette
-      # image, pour que les chiffres se comparent. Rapport seulement : les HIGH
-      # restants sont des paquets Debian sans correctif publie.
+      # image, pour que les chiffres se comparent. Echoue si le scanner ne tourne pas,
+      # jamais sur les failles trouvees : les HIGH restants sont des paquets
+      # Debian sans correctif publie.
       - name: Trivy scan of the built image (CRITICAL, HIGH)
-        continue-on-error: true
         run: |
           set -e
-          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/v0.68.1/contrib/install.sh | sh -s -- -b /usr/local/bin v0.68.1
-          trivy image -q --severity CRITICAL,HIGH --format json -o trivy-th2pulse.json th2pulse:pr-verify
-          trivy convert -q --format table trivy-th2pulse.json
+          docker run --rm -v /var/run/docker.sock:/var/run/docker.sock -v "$PWD:/out" aquasec/trivy:0.68.1 \
+            image -q --severity CRITICAL,HIGH --format json -o /out/trivy-th2pulse.json th2pulse:pr-verify
+          docker run --rm -v "$PWD:/out" aquasec/trivy:0.68.1 convert -q --format table /out/trivy-th2pulse.json
 
       - name: Upload the Trivy report
         if: always()
